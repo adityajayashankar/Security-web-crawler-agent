@@ -1,0 +1,12 @@
+requests
+tqdm
+crawl4ai
+playwright
+datasets
+transformers>=4.38.0
+peft>=0.10.0
+trl>=0.8.0
+accelerate
+bitsandbytes
+torch
+huggingface_hub

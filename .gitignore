@@ -1,0 +1,37 @@
+# Virtual environment
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Data folders
+data/raw/
+data/processed/
+
+# HuggingFace / model artifacts
+*.bin
+*.pt
+*.safetensors
+*.ckpt
+*.model
+checkpoints/
+output/
+
+# VS Code
+.vscode/
+
+# Large files
+*.csv
+*.jsonl
