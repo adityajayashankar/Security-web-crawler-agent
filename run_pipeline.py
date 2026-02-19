@@ -4,6 +4,10 @@ run_pipeline.py
 ---------------
 Master script — runs all crawlers in the correct order, then builds the dataset.
 
+FIX: All file paths now use pathlib.Path to avoid Windows backslash separator bugs.
+     'data\\raw_blogs.json' style strings are gone; Path('data') / 'raw_blogs.json'
+     is used everywhere — works on Win32, Linux, macOS identically.
+
 Usage:
     python run_pipeline.py              # full pipeline
     python run_pipeline.py --open-only  # skip closed/auth-required sources
@@ -25,7 +29,7 @@ Order:
    11.  Correlations      -> data/raw_correlations.json
    12.  Co-occurrence     -> data/raw_cooccurrence.json
    13.  Build             -> data/vuln_dataset.jsonl + data/training_pairs.jsonl
-   14.  Synthetic Pairs   -> appended to data/training_pairs.jsonl (only if thin layers detected)
+   14.  Synthetic Pairs   -> appended to data/training_pairs.jsonl (only if thin layers)
 """
 
 import sys
@@ -33,15 +37,21 @@ import argparse
 import time
 from pathlib import Path
 
+# ── Canonical data directory ───────────────────────────────────────────────
+# Using Path objects throughout eliminates Windows backslash separator bugs.
+# Never use string literals like 'data\\raw_blogs.json'.
+DATA_DIR          = Path("data")
+TRAINING_PAIRS    = DATA_DIR / "training_pairs.jsonl"
+VULN_DATASET      = DATA_DIR / "vuln_dataset.jsonl"
+
 sys.path.insert(0, str(Path(__file__).parent / "data"))
 
 # ── Load .env BEFORE anything else ────────────────────────────────────────
-# Uses python-dotenv if available (recommended), falls back to manual parser.
-# override=True means .env always wins over shell environment variables.
 try:
     from dotenv import load_dotenv
-    if Path(".env").exists():
-        load_dotenv(dotenv_path=".env", override=True)
+    env_file = Path(".env")
+    if env_file.exists():
+        load_dotenv(dotenv_path=env_file, override=True)
         print("Loaded .env")
     else:
         print("No .env file found — using shell environment variables only")
@@ -59,7 +69,7 @@ except ImportError:
             k, v = line.split("=", 1)
             k = k.strip()
             v = v.strip().strip('"').strip("'")
-            os.environ[k] = v          # assignment, not setdefault
+            os.environ[k] = v
         print("Loaded .env (manual parser)")
 
 
@@ -72,45 +82,47 @@ SYNTHETIC_LAYER_THRESHOLDS = {
 
 def step(label: str, fn, *args, **kwargs):
     """Run a pipeline step with timing and error isolation."""
-    print(f"\n{'='*60}")
-    print(f"  STEP: {label}")
-    print(f"{'='*60}")
+    print(f"\n{'─'*60}")
+    print(f"  ▶  {label}")
+    print(f"{'─'*60}")
     t0 = time.time()
     try:
         fn(*args, **kwargs)
         elapsed = time.time() - t0
-        print(f"\n  DONE: {label} in {elapsed:.1f}s")
-    except Exception as e:
-        print(f"\n  FAILED: {label}: {e}")
+        print(f"  ✅ Done in {elapsed:.1f}s")
+    except Exception as exc:
+        elapsed = time.time() - t0
+        print(f"  ❌ FAILED after {elapsed:.1f}s: {exc}")
         import traceback
         traceback.print_exc()
 
 
-def count_layers(training_pairs_path: str = "data/training_pairs.jsonl") -> dict:
-    """Count examples per layer in the current training_pairs.jsonl."""
+def count_layers(path: Path | None = None) -> dict:
+    """Count training pairs by layer in the JSONL file."""
     import json
-    p = Path(training_pairs_path)
-    if not p.exists():
-        return {}
-    counts: dict = {}
-    with open(p, encoding="utf-8") as f:
+    target = path or TRAINING_PAIRS
+    counts: dict[str, int] = {}
+    if not target.exists():
+        return counts
+    with open(target, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             try:
-                layer = json.loads(line).get("layer", "unknown")
+                rec = json.loads(line)
+                layer = rec.get("layer", "unknown")
                 counts[layer] = counts.get(layer, 0) + 1
             except Exception:
                 pass
     return counts
 
 
-def should_run_synthetic(training_pairs_path: str = "data/training_pairs.jsonl") -> bool:
+def should_run_synthetic() -> bool:
     """Return True if any layer is below its threshold."""
-    if not Path(training_pairs_path).exists():
+    if not TRAINING_PAIRS.exists():
         return False
-    counts = count_layers(training_pairs_path)
+    counts = count_layers()
     for layer, threshold in SYNTHETIC_LAYER_THRESHOLDS.items():
         actual = counts.get(layer, 0)
         if actual < threshold:
@@ -138,11 +150,12 @@ def main():
     parser.add_argument("--from-build",   action="store_true", help="Skip crawling, rebuild dataset only")
     parser.add_argument("--correlate",    action="store_true", help="Re-run correlation step then rebuild")
     parser.add_argument("--synthetic",    action="store_true", help="Re-run synthetic pair generation only")
-    parser.add_argument("--no-synthetic", action="store_true", help="Skip synthetic generation even if layers are thin")
+    parser.add_argument("--no-synthetic", action="store_true", help="Skip synthetic generation even if layers thin")
     parser.add_argument("--nvd-total",    type=int, default=10000, help="NVD records to fetch")
     args = parser.parse_args()
 
-    Path("data").mkdir(exist_ok=True)
+    # FIX: use Path.mkdir, not os.makedirs or string "data"
+    DATA_DIR.mkdir(exist_ok=True)
 
     # ── --synthetic only ───────────────────────────────────────────────────
     if args.synthetic:
@@ -176,7 +189,9 @@ def main():
         step("GitHub Security Advisories", run_github)
 
         from data.crawl_blogs import run as run_blogs
-        step("Security Blogs (Exploit-DB / OWASP / Vulhub)", run_blogs)
+        # FIX: pass out as a Path-derived string — consistent cross-platform
+        step("Security Blogs (Exploit-DB / OWASP / Vulhub)", run_blogs,
+             out=str(DATA_DIR / "raw_blogs.json"))
 
         from data.crawl_exploitdb import run as run_exploitdb
         step("Exploit-DB Bulk CSV", run_exploitdb)
@@ -223,26 +238,31 @@ def _print_summary(show_layer_counts: bool = False):
     print("  Pipeline complete!")
     print(f"{'='*60}")
 
+    # FIX: all paths built via Path objects — no backslash literals
     outputs = {
-        "data/raw_mitre_attack.json":      "ATT&CK + CAPEC data",
-        "data/raw_vendor_advisories.json": "Cisco/RedHat/Ubuntu/Debian",
-        "data/raw_correlations.json":      "CVE correlation graph",
-        "data/raw_cooccurrence.json":      "P(B|A) co-occurrence model",
-        "data/vuln_dataset.jsonl":         "full schema records",
-        "data/training_pairs.jsonl":       "fine-tuning pairs",
+        DATA_DIR / "raw_mitre_attack.json":      "ATT&CK + CAPEC data",
+        DATA_DIR / "raw_vendor_advisories.json": "Cisco/RedHat/Ubuntu/Debian",
+        DATA_DIR / "raw_correlations.json":      "CVE correlation graph",
+        DATA_DIR / "raw_cooccurrence.json":      "P(B|A) co-occurrence model",
+        DATA_DIR / "vuln_dataset.jsonl":         "full schema records",
+        DATA_DIR / "training_pairs.jsonl":       "fine-tuning pairs",
     }
     print("  Outputs:")
     for path, desc in outputs.items():
-        status = "OK" if Path(path).exists() else "MISSING"
-        print(f"    [{status}]  {path:<42} — {desc}")
+        status = "OK" if path.exists() else "MISSING"
+        print(f"    [{status}]  {str(path):<42} — {desc}")
 
-    if show_layer_counts and Path("data/training_pairs.jsonl").exists():
+    if show_layer_counts and TRAINING_PAIRS.exists():
         counts = count_layers()
         total  = sum(counts.values())
         print(f"\n  Training pairs by layer (total: {total:,}):")
         for layer, count in sorted(counts.items(), key=lambda x: -x[1]):
             threshold = SYNTHETIC_LAYER_THRESHOLDS.get(layer)
-            flag = f"  WARNING: below threshold ({threshold})" if threshold and count < threshold else ""
+            flag = (
+                f"  ⚠️  below threshold ({threshold})"
+                if threshold and count < threshold
+                else ""
+            )
             print(f"    {layer:<38} {count:>7,}{flag}")
 
     print("\n  Next steps:")
