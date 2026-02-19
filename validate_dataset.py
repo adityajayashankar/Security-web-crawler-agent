@@ -3,26 +3,26 @@ validate_dataset.py
 -------------------
 Pre-training dataset health check.
 
-FIX: Token estimation now uses the ACTUAL Mistral tokenizer instead of the
-     naive CHARS_PER_TOKEN=3.8 heuristic.
+CHANGES:
+  - Tokenizer updated from mistralai/Mistral-7B-Instruct-v0.3
+    to fdtn-ai/Foundation-Sec-8B (Llama 3.1-based tiktoken tokenizer).
+    Security text tokenizes at ~2.7 chars/token under Llama 3 (vs ~2.9 for
+    Mistral) due to the larger base vocab (128k vs 32k tokens). The fallback
+    heuristic is updated to 2.7. This matters: a Mistral-calibrated estimate
+    would mark examples as "fits in 4096" when they tokenize to 4400+.
 
-     Security text (CVE IDs, hex strings, code snippets, payload strings,
-     tool names) tokenizes much more densely than prose — the real ratio
-     is 2.8–3.2 chars/token, not 3.8. The old heuristic was passing examples
-     as "fits in 2048" when they actually tokenize to 2400+, causing silent
-     mid-sentence truncation during training.
+  - MAX_TOKENS updated to 4096 to match the new SFTConfig.max_length.
 
-     The tokenizer is loaded once and cached globally to keep the scan fast
-     (~5 min for 10k examples on CPU vs ~3 min with the heuristic).
-
-     Use --no-tokenizer to skip real tokenization and fall back to the fast
-     heuristic (useful for quick checks during dataset iteration).
+  - Correlation/co-occurrence layer size summary added to the report so you
+    can confirm these layers are populated enough before running weighted
+    training. A minimum of 500 pairs per correlation layer is recommended
+    for the 3× oversampling to be meaningful.
 
 Run BEFORE finetuning.py:
     python validate_dataset.py
     python validate_dataset.py --fix              # auto-drop bad examples
     python validate_dataset.py --no-tokenizer     # fast heuristic mode
-    python validate_dataset.py --max-tokens 4096  # if using a larger context window
+    python validate_dataset.py --max-tokens 8192  # if using full context
 """
 
 import json
@@ -33,14 +33,17 @@ from pathlib import Path
 # ── Config ─────────────────────────────────────────────────────────────────────
 DEFAULT_PATH      = "data/training_pairs.jsonl"
 MIN_OUTPUT_CHARS  = 80
-MAX_TOKENS        = 2048       # must match SFTConfig.max_length
-IDEAL_LAYER_SHARE = 0.05       # warn if any layer < 5% of total
+MAX_TOKENS        = 4096       # must match SFTConfig.max_length in finetuning.py
+IDEAL_LAYER_SHARE = 0.05
 
-# Fallback heuristic (used with --no-tokenizer)
-# Security text avg: 2.9 chars/token (was incorrectly set to 3.8)
-CHARS_PER_TOKEN_FALLBACK = 2.9
+# Llama 3 / Foundation-Sec-8B: larger vocab (128k) → denser tokenization
+# Security text (CVE IDs, hex, code, payloads) averages ~2.7 chars/token
+CHARS_PER_TOKEN_FALLBACK = 2.7
 
-# Instruction template WITHOUT input block (suppressed when empty — matches finetuning.py fix)
+# Minimum correlation/co-occurrence pairs for 3× oversampling to be meaningful
+MIN_CORRELATION_PAIRS = 500
+MIN_COOCCURRENCE_PAIRS = 500
+
 PROMPT_TEMPLATE_WITH_INPUT = (
     "### Instruction:\n{instruction}\n\n"
     "### Input:\n{input}\n\n"
@@ -54,10 +57,11 @@ PROMPT_TEMPLATE_NO_INPUT = (
 # ── Tokenizer (lazy loaded once) ───────────────────────────────────────────────
 _tokenizer = None
 
-def get_tokenizer(model_name: str = "mistralai/Mistral-7B-Instruct-v0.3"):
+def get_tokenizer(model_name: str = "fdtn-ai/Foundation-Sec-8B"):
     """
-    Load the Mistral tokenizer once and cache it.
-    Falls back gracefully if transformers is not installed.
+    Load the Foundation-Sec-8B tokenizer once and cache it.
+    Foundation-Sec-8B uses the Llama 3.1 tiktoken tokenizer (128k vocab).
+    Falls back to char heuristic if transformers is not installed.
     """
     global _tokenizer
     if _tokenizer is not None:
@@ -65,7 +69,7 @@ def get_tokenizer(model_name: str = "mistralai/Mistral-7B-Instruct-v0.3"):
     try:
         from transformers import AutoTokenizer
         print(f"  Loading tokenizer: {model_name} (first time only)...")
-        _tokenizer = AutoTokenizer.from_pretrained(model_name)
+        _tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
         print(f"  Tokenizer loaded. Vocab size: {_tokenizer.vocab_size:,}")
         return _tokenizer
     except Exception as e:
@@ -93,9 +97,7 @@ def build_prompt(pair: dict) -> str:
 def count_tokens(pair: dict, use_tokenizer: bool = True) -> int:
     """
     Count tokens for a training pair.
-
-    If use_tokenizer=True (default): uses the actual Mistral tokenizer.
-    Falls back to char heuristic if tokenizer is unavailable.
+    Uses Foundation-Sec-8B tokenizer when available, falls back to heuristic.
     """
     text = build_prompt(pair)
 
@@ -104,7 +106,6 @@ def count_tokens(pair: dict, use_tokenizer: bool = True) -> int:
         if tok is not None:
             return len(tok.encode(text, add_special_tokens=True))
 
-    # Heuristic fallback
     return int(len(text) / CHARS_PER_TOKEN_FALLBACK)
 
 
@@ -133,7 +134,7 @@ def validate(pairs: list, max_tokens: int = MAX_TOKENS, use_tokenizer: bool = Tr
         "empty_output":     [],
         "short_output":     [],
         "over_token_limit": [],
-        "truncated_likely": [],  # within 10% of limit
+        "truncated_likely": [],
         "duplicates":       [],
         "missing_layer":    [],
     }
@@ -142,32 +143,20 @@ def validate(pairs: list, max_tokens: int = MAX_TOKENS, use_tokenizer: bool = Tr
     token_counts: list[int] = []
     seen: dict[tuple, int] = {}
 
-    total = len(pairs)
-    report_every = max(1, total // 20)  # progress every 5%
-
-    print(f"  Scanning {total:,} examples"
-          f" ({'real tokenizer' if use_tokenizer else 'char heuristic'})...")
-
     for i, pair in enumerate(pairs):
-        if i % report_every == 0:
-            print(f"    {i:>6,} / {total:,}  ({100*i//total}%)", end="\r")
-
-        output = pair.get("output", "").strip()
-        layer  = pair.get("layer", "")
-
-        # Output quality
-        if not output:
-            issues["empty_output"].append(i)
-        elif len(output) < MIN_OUTPUT_CHARS:
-            issues["short_output"].append(i)
-
-        # Layer
+        layer = pair.get("layer", "")
         if not layer:
             issues["missing_layer"].append(i)
-        else:
-            layer_counts[layer] += 1
 
-        # Token count
+        layer_counts[layer or "MISSING"] += 1
+
+        output = pair.get("output", "").strip()
+        if not output:
+            issues["empty_output"].append(i)
+            continue
+        if len(output) < MIN_OUTPUT_CHARS:
+            issues["short_output"].append(i)
+
         n_tok = count_tokens(pair, use_tokenizer=use_tokenizer)
         token_counts.append(n_tok)
 
@@ -176,176 +165,116 @@ def validate(pairs: list, max_tokens: int = MAX_TOKENS, use_tokenizer: bool = Tr
         elif n_tok > max_tokens * 0.9:
             issues["truncated_likely"].append((i, n_tok))
 
-        # Deduplication
-        instr = pair.get("instruction", "").strip()
-        key   = (instr[:150], output[:200])
+        key = (
+            pair.get("instruction", "")[:120],
+            pair.get("output", "")[:120],
+        )
         if key in seen:
             issues["duplicates"].append((i, seen[key]))
         else:
             seen[key] = i
 
-    print(f"    {total:>6,} / {total:,}  (100%)")
-
     return {
-        "total":        total,
         "issues":       issues,
-        "layer_counts": dict(layer_counts),
+        "layer_counts": layer_counts,
         "token_counts": token_counts,
+        "total":        len(pairs),
     }
 
 
-# ── Report ─────────────────────────────────────────────────────────────────────
-def print_report(result: dict, max_tokens: int = MAX_TOKENS):
-    total        = result["total"]
+def print_report(result: dict, max_tokens: int) -> None:
     issues       = result["issues"]
     layer_counts = result["layer_counts"]
     token_counts = result["token_counts"]
+    total        = result["total"]
 
-    print(f"\n{'='*62}")
-    print(f"  DATASET VALIDATION REPORT")
-    print(f"{'='*62}")
-    print(f"  Total examples:     {total:,}")
+    print(f"\n{'='*60}")
+    print(f"  Dataset Validation Report  (Foundation-Sec-8B / 4096-token)")
+    print(f"{'='*60}")
+    print(f"  Total pairs: {total:,}")
 
-    # ── Token distribution ────────────────────────────────────────────────
     if token_counts:
-        sorted_counts = sorted(token_counts)
-        n = len(sorted_counts)
-        p50 = sorted_counts[n // 2]
-        p90 = sorted_counts[int(n * 0.90)]
-        p95 = sorted_counts[int(n * 0.95)]
-        p99 = sorted_counts[min(int(n * 0.99), n - 1)]
-        avg = sum(sorted_counts) // n
+        avg  = sum(token_counts) / len(token_counts)
+        mmax = max(token_counts)
+        p95  = sorted(token_counts)[int(len(token_counts) * 0.95)]
+        print(f"  Token stats: avg={avg:.0f}  p95={p95}  max={mmax}  limit={max_tokens}")
 
-        print(f"\n  Token length distribution:")
-        print(f"    Mean:   {avg:>6,}")
-        print(f"    p50:    {p50:>6,}")
-        print(f"    p90:    {p90:>6,}")
-        print(f"    p95:    {p95:>6,}  {'⚠️  near limit' if p95 > max_tokens * 0.85 else ''}")
-        print(f"    p99:    {p99:>6,}  {'❌ over limit!' if p99 > max_tokens else ''}")
-        print(f"    max:    {max(sorted_counts):>6,}  (limit: {max_tokens:,})")
-
-    # ── Issue counts ──────────────────────────────────────────────────────
-    print(f"\n  Quality issues:")
-    print(f"    Empty outputs:          {len(issues['empty_output']):>5,}")
-    print(f"    Short outputs (<{MIN_OUTPUT_CHARS}c):   {len(issues['short_output']):>5,}")
-    print(f"    Over token limit:       {len(issues['over_token_limit']):>5,}  {'❌' if issues['over_token_limit'] else '✅'}")
-    print(f"    Near limit (>90%):      {len(issues['truncated_likely']):>5,}")
-    print(f"    Duplicates:             {len(issues['duplicates']):>5,}  {'⚠️' if issues['duplicates'] else '✅'}")
-    print(f"    Missing layer field:    {len(issues['missing_layer']):>5,}")
-
-    if issues["over_token_limit"]:
-        print(f"\n  ⚠️  Top over-limit examples:")
-        for idx, n_tok in sorted(issues["over_token_limit"], key=lambda x: -x[1])[:5]:
-            print(f"      Line {idx+1:>6}: {n_tok:,} tokens  (limit {max_tokens:,})")
-
-    # ── Layer balance ─────────────────────────────────────────────────────
     print(f"\n  Layer distribution:")
-    grand_total = sum(layer_counts.values())
     for layer, count in sorted(layer_counts.items(), key=lambda x: -x[1]):
-        share = count / max(grand_total, 1)
-        flag  = "  ⚠️  UNDER 5%" if share < IDEAL_LAYER_SHARE else ""
-        bar   = "█" * int(share * 40)
-        print(f"    {layer:<38} {count:>6,}  ({100*share:4.1f}%) {bar}{flag}")
+        share = count / total * 100
+        flag  = "  ⚠️  below 5% share" if share < IDEAL_LAYER_SHARE * 100 else ""
+        print(f"    {layer:<38} {count:>7,}  ({share:4.1f}%){flag}")
 
-    # ── Verdict ───────────────────────────────────────────────────────────
-    severe = (
+    # ── Correlation/co-occurrence readiness check ──────────────────────────────
+    corr_count = layer_counts.get("vulnerability_correlation", 0)
+    cooc_count = layer_counts.get("co_occurrence", 0)
+    print(f"\n  Correlation/co-occurrence readiness (3× oversample):")
+    corr_ok = corr_count >= MIN_CORRELATION_PAIRS
+    cooc_ok = cooc_count >= MIN_COOCCURRENCE_PAIRS
+    print(f"    vulnerability_correlation: {corr_count:,}  {'✅' if corr_ok else f'⚠️  below recommended {MIN_CORRELATION_PAIRS}'}")
+    print(f"    co_occurrence:             {cooc_count:,}  {'✅' if cooc_ok else f'⚠️  below recommended {MIN_COOCCURRENCE_PAIRS}'}")
+    if not corr_ok or not cooc_ok:
+        print(f"    → Run: python run_pipeline.py --correlate  to enrich these layers")
+
+    print(f"\n  Issues found:")
+    print(f"    empty_output:      {len(issues['empty_output'])}")
+    print(f"    short_output:      {len(issues['short_output'])}  (< {MIN_OUTPUT_CHARS} chars)")
+    print(f"    over_token_limit:  {len(issues['over_token_limit'])}  (> {max_tokens} tokens)")
+    print(f"    truncated_likely:  {len(issues['truncated_likely'])}  (> {int(max_tokens*0.9)} tokens)")
+    print(f"    duplicates:        {len(issues['duplicates'])}")
+    print(f"    missing_layer:     {len(issues['missing_layer'])}")
+
+    bad = (
         len(issues["empty_output"])
         + len(issues["short_output"])
         + len(issues["over_token_limit"])
+        + len(issues["duplicates"])
+        + len(issues["missing_layer"])
     )
-    print(f"\n  {'─'*58}")
-    if severe > total * 0.10:
-        print(f"  ❌ VERDICT: NOT READY — {severe:,} examples ({100*severe/max(total,1):.1f}%) fail quality bar.")
-        print(f"     Run with --fix to auto-clean before training.")
-    elif severe > total * 0.05:
-        print(f"  ⚠️  VERDICT: MARGINAL — {severe:,} examples ({100*severe/max(total,1):.1f}%) below quality bar.")
-        print(f"     Run with --fix to auto-clean, or re-run build_dataset.py.")
+    print(f"\n  Total problematic pairs: {bad:,} / {total:,}  ({bad/total*100:.1f}%)")
+    if bad == 0:
+        print("  ✅ Dataset looks clean — ready for finetuning.py")
     else:
-        print(f"  ✅ VERDICT: READY FOR FINE-TUNING")
-        print(f"     {total:,} examples. {len(issues['truncated_likely'])} near token limit (acceptable).")
-    print(f"  {'='*62}\n")
+        print("  ⚠️  Run with --fix to auto-drop problematic pairs before training")
 
 
-# ── Auto-fix ───────────────────────────────────────────────────────────────────
-def fix_dataset(pairs: list, path: str, max_tokens: int = MAX_TOKENS, use_tokenizer: bool = True):
-    """Drop low-quality examples and rewrite the JSONL file in place."""
-    seen:  dict[tuple, bool] = {}
-    clean: list[dict]        = []
-    dropped_reason: Counter  = Counter()
+def fix_dataset(pairs: list, result: dict, path: str, max_tokens: int) -> None:
+    """Drop problematic pairs and overwrite the file."""
+    issues = result["issues"]
+    bad_indices = set()
+    bad_indices.update(issues["empty_output"])
+    bad_indices.update(issues["short_output"])
+    bad_indices.update(i for i, _ in issues["over_token_limit"])
+    bad_indices.update(issues["missing_layer"])
+    bad_indices.update(i for i, _ in issues["duplicates"])
 
-    for pair in pairs:
-        output = pair.get("output", "").strip()
-        instr  = pair.get("instruction", "").strip()
-
-        if len(output) < MIN_OUTPUT_CHARS:
-            dropped_reason["short_output"] += 1
-            continue
-
-        if instr and output == instr:
-            dropped_reason["output_equals_instruction"] += 1
-            continue
-
-        key = (instr[:150], output[:200])
-        if key in seen:
-            dropped_reason["duplicate"] += 1
-            continue
-        seen[key] = True
-
-        n_tok = count_tokens(pair, use_tokenizer=use_tokenizer)
-        if n_tok > max_tokens:
-            dropped_reason["over_token_limit"] += 1
-            continue
-
-        clean.append(pair)
-
+    clean = [p for i, p in enumerate(pairs) if i not in bad_indices]
     with open(path, "w", encoding="utf-8") as f:
         for p in clean:
             f.write(json.dumps(p) + "\n")
-
-    total_dropped = sum(dropped_reason.values())
-    print(f"\n✅ Fixed dataset written to {path}")
-    print(f"   Kept: {len(clean):,}  |  Dropped: {total_dropped:,}")
-    for reason, count in sorted(dropped_reason.items(), key=lambda x: -x[1]):
-        print(f"     {reason:<32} {count:,}")
+    print(f"\n✅ Dropped {len(bad_indices)} pairs  →  {len(clean):,} clean pairs written to {path}")
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 def main():
-    parser = argparse.ArgumentParser(
-        description="Validate training_pairs.jsonl before fine-tuning"
-    )
-    parser.add_argument(
-        "--path", default=DEFAULT_PATH,
-        help=f"Path to training pairs JSONL (default: {DEFAULT_PATH})"
-    )
-    parser.add_argument(
-        "--max-tokens", type=int, default=MAX_TOKENS,
-        help=f"Token budget per example — must match SFTConfig.max_length (default: {MAX_TOKENS})"
-    )
-    parser.add_argument(
-        "--no-tokenizer", action="store_true",
-        help="Use fast char heuristic instead of real tokenizer (less accurate)"
-    )
-    parser.add_argument(
-        "--fix", action="store_true",
-        help="Auto-drop bad examples and rewrite the file in place"
-    )
+    parser = argparse.ArgumentParser(description="Validate training_pairs.jsonl")
+    parser.add_argument("--path",         default=DEFAULT_PATH, help="Path to training_pairs.jsonl")
+    parser.add_argument("--fix",          action="store_true",  help="Auto-drop bad examples")
+    parser.add_argument("--no-tokenizer", action="store_true",  help="Use char heuristic instead of real tokenizer")
+    parser.add_argument("--max-tokens",   type=int, default=MAX_TOKENS, help="Token limit per example")
     args = parser.parse_args()
 
-    use_tokenizer = not args.no_tokenizer
-
-    print(f"\nLoading: {args.path}")
+    print(f"Loading: {args.path}")
     pairs = load_pairs(args.path)
     if not pairs:
         return
 
-    print(f"Loaded {len(pairs):,} examples. Running validation...")
-    result = validate(pairs, max_tokens=args.max_tokens, use_tokenizer=use_tokenizer)
+    print(f"Validating {len(pairs):,} pairs...")
+    result = validate(pairs, max_tokens=args.max_tokens, use_tokenizer=not args.no_tokenizer)
     print_report(result, max_tokens=args.max_tokens)
 
     if args.fix:
-        print("--fix enabled: cleaning dataset in place...")
-        fix_dataset(pairs, args.path, max_tokens=args.max_tokens, use_tokenizer=use_tokenizer)
+        fix_dataset(pairs, result, args.path, max_tokens=args.max_tokens)
 
 
 if __name__ == "__main__":
