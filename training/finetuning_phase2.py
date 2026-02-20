@@ -52,6 +52,7 @@ Memory: ~14GB on A100 (Phase 1 merged model in bfloat16 + small Phase 2 adapter)
 """
 
 import json
+import re
 import random
 import torch
 from pathlib import Path
@@ -76,7 +77,7 @@ OUTPUT_DIR     = Path("./checkpoints/vuln-foundation-sec-8b-phase2")
 HF_REPO_NAME   = "adityajayashankar/vuln-foundation-sec-8b-correlation"
 
 # Only these two layers go into Phase 2 training
-PHASE2_LAYERS  = {"vulnerability_correlation", "co_occurrence"}
+PHASE2_LAYERS  = {"vulnerability_correlation", "vulnerability_cooccurrence"}
 
 EVAL_FRACTION  = 0.10    # 10% eval — higher than phase 1 since dataset is smaller
 MIN_EVAL       = 30
@@ -142,27 +143,70 @@ def load_phase2_pairs(path: Path) -> list[dict]:
     return phase2_pairs
 
 
-# ── Stratified split ───────────────────────────────────────────────────────────
+# ── CVE-decontaminated split ───────────────────────────────────────────────────────
+
+_CVE_RE = re.compile(r'(CVE-\d{4}-\d{4,}|GHSA-[a-z0-9-]+)')
+
+def _extract_cve(pair: dict) -> str:
+    cid = pair.get("cve_id", "")
+    if cid:
+        return cid
+    m = _CVE_RE.search(pair.get("instruction", ""))
+    return m.group(1) if m else ""
+
+
 def stratified_split(
     pairs: list[dict],
     eval_fraction: float = EVAL_FRACTION,
     min_eval: int = MIN_EVAL,
 ) -> tuple[list[dict], list[dict]]:
-    by_layer: dict[str, list[dict]] = defaultdict(list)
+    """
+    CVE-aware split: all pairs for a given CVE go to train OR eval, never both.
+    Prevents eval recall inflation from info leakage.
+    """
+    cve_pairs: dict[str, list[dict]] = defaultdict(list)
+    no_cve: list[dict] = []
+
     for p in pairs:
-        by_layer[p.get("layer", "general")].append(p)
+        cve = _extract_cve(p)
+        if cve:
+            cve_pairs[cve].append(p)
+        else:
+            no_cve.append(p)
+
+    cve_ids = list(cve_pairs.keys())
+    random.shuffle(cve_ids)
+    total_with_cve = sum(len(ps) for ps in cve_pairs.values())
+    target_eval = max(min_eval, int(total_with_cve * eval_fraction))
+
+    eval_cves: set[str] = set()
+    eval_count = 0
+    for cve in cve_ids:
+        if eval_count >= target_eval:
+            break
+        eval_cves.add(cve)
+        eval_count += len(cve_pairs[cve])
 
     train_pairs, eval_pairs = [], []
-    for layer, items in by_layer.items():
-        random.shuffle(items)
-        n_eval = max(min_eval, int(len(items) * eval_fraction))
-        n_eval = min(n_eval, len(items))
-        eval_pairs  += items[:n_eval]
-        train_pairs += items[n_eval:]
+    for cve, ps in cve_pairs.items():
+        if cve in eval_cves:
+            eval_pairs.extend(ps)
+        else:
+            train_pairs.extend(ps)
+
+    random.shuffle(no_cve)
+    n_eval_nc = max(1, int(len(no_cve) * eval_fraction)) if no_cve else 0
+    eval_pairs.extend(no_cve[:n_eval_nc])
+    train_pairs.extend(no_cve[n_eval_nc:])
 
     random.shuffle(train_pairs)
     random.shuffle(eval_pairs)
-    print(f"\n  Phase 2 split: {len(train_pairs):,} train  /  {len(eval_pairs):,} eval")
+
+    train_cves = {_extract_cve(p) for p in train_pairs} - {""}
+    eval_cves_actual = {_extract_cve(p) for p in eval_pairs} - {""}
+    overlap = train_cves & eval_cves_actual
+    print(f"\n  CVE-decontaminated Phase 2 split: {len(train_pairs):,} train  /  {len(eval_pairs):,} eval")
+    print(f"    Train CVEs: {len(train_cves):,}  |  Eval CVEs: {len(eval_cves_actual):,}  |  Overlap: {len(overlap)}")
     return train_pairs, eval_pairs
 
 

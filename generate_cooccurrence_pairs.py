@@ -34,7 +34,9 @@ random.seed(42)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def load_nvd_index(path):
+    """Load NVD records; report year range for temporal awareness."""
     index = {}
+    years = set()
     if not path.exists():
         return index
     with open(path) as f:
@@ -44,9 +46,21 @@ def load_nvd_index(path):
                 cid = rec.get("cve_id") or rec.get("id", "")
                 if cid:
                     index[cid] = rec
+                    # Track year for temporal reporting
+                    pub = rec.get("published_date", rec.get("date_published", ""))
+                    if pub:
+                        years.add(pub[:4])
+                    elif cid.startswith("CVE-"):
+                        parts = cid.split("-")
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            years.add(parts[1])
             except json.JSONDecodeError:
                 pass
     log.info(f"  NVD index: {len(index):,} CVEs")
+    if years:
+        sorted_years = sorted(years)
+        log.info(f"  NVD date range: {sorted_years[0]} \u2192 {sorted_years[-1]}  "
+                 f"({len(sorted_years)} distinct years)")
     return index
 
 
@@ -95,12 +109,20 @@ def cve_product(cve_id, nvd_index):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def group_by_trigger(all_pairs):
+    """Group co-occurrence pairs by trigger CVE, creating reverse pairs with
+    asymmetric confidence: P(B|A) \u2260 P(A|B).  Reverse pairs get a random
+    perturbation (0.75\u00d7\u20131.15\u00d7) to teach the model directionality."""
     grouped = defaultdict(list)
     for p in all_pairs:
         a, b = p["cve_a"], p["cve_b"]
         grouped[a].append(p)
+        # Reverse pair \u2014 perturb confidence to teach P(A|B) \u2260 P(B|A)
         rev = dict(p)
         rev["cve_a"], rev["cve_b"] = b, a
+        orig_conf = p.get("confidence", 0.5)
+        asym_factor = random.uniform(0.75, 1.15)
+        rev["confidence"] = round(min(0.99, max(0.10, orig_conf * asym_factor)), 2)
+        rev["_reversed"] = True
         grouped[b].append(rev)
     for cve in grouped:
         grouped[cve].sort(key=lambda x: x.get("confidence", 0), reverse=True)
@@ -122,7 +144,9 @@ POSITIVE_INPUTS = [
     "SIEM alert triggered for {cve_a}.\nDescription: {desc_a}\n\nFor incident response: what other CVEs should be checked immediately given this finding?",
 ]
 
-POSITIVE_OUTPUT = """Co-occurrence Analysis: {cve_a}
+POSITIVE_OUTPUT_VARIANTS = [
+    # Variant 0: Full structured report
+    """Co-occurrence Analysis: {cve_a}
 
 CONFIRMED FINDING
 ─────────────────
@@ -140,11 +164,58 @@ REASONING
 
 INVESTIGATION PRIORITY
 ──────────────────────
-{priority_block}"""
+{priority_block}""",
+    # Variant 1: Concise assessment
+    """{cve_a} ({sev_a}, CVSS {cvss_a}) — Co-occurrence Assessment
+Product: {product_a}
+
+Co-present vulnerabilities ranked by confidence:
+
+{related_block}
+
+{reasoning_short}
+
+Priority order:
+{priority_block}""",
+    # Variant 2: Probability-focused report
+    """Co-occurrence probability report for {cve_a}:
+
+Product: {product_a} | Severity: {sev_a} | CVSS: {cvss_a}
+
+Ranked co-present vulnerabilities:
+
+{related_block}
+
+Intelligence sources: {sources_text}
+These probabilities reflect observed co-presence frequency across multi-source
+vulnerability intelligence (NVD, CISA KEV, exploit chains, CWE family clusters).""",
+    # Variant 3: Incident response advisory
+    """IR ADVISORY — {cve_a} confirmed exploited
+
+Trigger: {cve_a} | {sev_a} | CVSS {cvss_a}
+Environment: {product_a}
+{desc_a}
+
+IMMEDIATE INVESTIGATION TARGETS:
+{priority_block}
+
+DETAILED CO-OCCURRENCE ANALYSIS:
+{related_block}
+
+CHAIN REASONING:
+{reasoning}""",
+]
 
 
 def make_positive_pairs(trigger_cve, related_pairs, nvd_index, num_variants=4):
-    """Generate up to num_variants differently-phrased pairs for one trigger CVE."""
+    """Generate up to num_variants pairs with diversified outputs per trigger CVE.
+
+    Each variant gets:
+      - A different input template (as before)
+      - A different output format (full/concise/probability/IR)
+      - A different slice and ordering of related CVEs
+    This prevents the model from memorizing a single output template.
+    """
     if not related_pairs:
         return []
 
@@ -154,52 +225,60 @@ def make_positive_pairs(trigger_cve, related_pairs, nvd_index, num_variants=4):
     cvss_str  = f"{cvss_a:.1f}" if cvss_a else "N/A"
     product_a = cve_product(trigger_cve, nvd_index) or "affected system"
 
-    # Different slices of related CVEs for variety
-    top5 = related_pairs[:5]
-    sources = list(set(p.get("source", "") for p in top5))
+    sources_all = list(set(p.get("source", "") for p in related_pairs[:5]))
 
-    # Build reasoning once
+    # Build reasoning
     parts = []
-    if any("attack_chain" in s for s in sources):
+    if any("attack_chain" in s for s in sources_all):
         parts.append("These CVEs form a sequential exploit chain — the trigger creates preconditions the related CVEs directly exploit.")
-    if any("remediation_tie" in s for s in sources):
+    if any("remediation_tie" in s for s in sources_all):
         parts.append("Several related CVEs share the same patch — structural coupling in the codebase.")
-    if any("kev" in s for s in sources):
+    if any("kev" in s for s in sources_all):
         parts.append("CISA KEV data shows these were added in the same campaign window — actively chained by threat actors.")
-    if any("cwe" in s for s in sources):
+    if any("cwe" in s for s in sources_all):
         parts.append("CWE CanPrecede chain — the trigger's weakness class structurally enables the related CVEs.")
-    if any("stack" in s for s in sources):
+    if any("stack" in s for s in sources_all):
         parts.append("Same technology stack — co-present when this deployment profile is confirmed.")
     reasoning = " ".join(parts) if parts else "Statistical co-occurrence from multi-source vulnerability intelligence."
+    reasoning_short = parts[0] if parts else reasoning
 
-    related_lines = []
-    for i, p in enumerate(top5, 1):
-        b      = p["cve_b"]
-        conf   = p.get("confidence", 0)
-        reason = p.get("reason", "co-occurrence detected")
-        sev_b  = cve_severity(b, nvd_index)
-        desc_b = cve_summary(b, nvd_index, 100)
-        label  = "HIGH" if conf >= 0.80 else "MEDIUM" if conf >= 0.65 else "LOW"
-        related_lines.append(
-            f"[{i}] {b} ({label} {conf:.0%}) | {sev_b}\n"
-            f"    {reason}\n"
-            f"    {desc_b}"
-        )
-    related_block  = "\n\n".join(related_lines)
-    priority_block = "\n".join(f"  {i}. {p['cve_b']} — {p.get('reason','')[:70]}"
-                               for i, p in enumerate(top5, 1))
-
-    out_text = POSITIVE_OUTPUT.format(
-        cve_a=trigger_cve, sev_a=sev_a, cvss_a=cvss_str,
-        product_a=product_a, desc_a=desc_a,
-        related_block=related_block, reasoning=reasoning,
-        priority_block=priority_block,
-    ).strip()
-
-    # Pick num_variants different input templates
     templates = random.sample(POSITIVE_INPUTS, min(num_variants, len(POSITIVE_INPUTS)))
     pairs = []
-    for tmpl in templates:
+    for vi, tmpl in enumerate(templates):
+        # ── Output diversity: different CVE order, slice, and format per variant ──
+        shuffled = list(related_pairs)
+        random.shuffle(shuffled)
+        slice_size = random.choice([3, 4, 5])
+        top_n = shuffled[:min(slice_size, len(shuffled))]
+
+        related_lines = []
+        for i, p in enumerate(top_n, 1):
+            b      = p["cve_b"]
+            conf   = p.get("confidence", 0)
+            reason = p.get("reason", "co-occurrence detected")
+            sev_b  = cve_severity(b, nvd_index)
+            desc_b = cve_summary(b, nvd_index, 100)
+            label  = "HIGH" if conf >= 0.80 else "MEDIUM" if conf >= 0.65 else "LOW"
+            related_lines.append(
+                f"[{i}] {b} ({label} {conf:.0%}) | {sev_b}\n"
+                f"    {reason}\n"
+                f"    {desc_b}"
+            )
+        related_block  = "\n\n".join(related_lines)
+        priority_block = "\n".join(f"  {i}. {p['cve_b']} — {p.get('reason','')[:70]}"
+                                   for i, p in enumerate(top_n, 1))
+        sources_text   = ", ".join(s for s in sources_all if s) or "multi-source intelligence"
+
+        fmt = POSITIVE_OUTPUT_VARIANTS[vi % len(POSITIVE_OUTPUT_VARIANTS)]
+        out_text = fmt.format(
+            cve_a=trigger_cve, sev_a=sev_a, cvss_a=cvss_str,
+            product_a=product_a, desc_a=desc_a,
+            related_block=related_block, reasoning=reasoning,
+            reasoning_short=reasoning_short,
+            priority_block=priority_block,
+            sources_text=sources_text,
+        ).strip()
+
         inp = tmpl.format(
             cve_a=trigger_cve, desc_a=desc_a, sev_a=sev_a,
             cvss_a=cvss_str, product_a=product_a,
@@ -211,8 +290,8 @@ def make_positive_pairs(trigger_cve, related_pairs, nvd_index, num_variants=4):
             "output":   out_text,
             "metadata": {
                 "trigger_cve":   trigger_cve,
-                "related_count": len(top5),
-                "sources":       sources,
+                "related_count": len(top_n),
+                "sources":       sources_all,
             },
         })
     return pairs
@@ -252,6 +331,8 @@ CHAIN REASONING
 
 
 def make_negative_pairs(rule, nvd_index, num_variants=3):
+    """Generate negative inference pairs with output diversity per variant.
+    Shuffles absent CVE ordering and alternates full/brief output format."""
     absent  = rule.get("absent_cves", [])
     still   = rule.get("still_assess", [])
     cond    = rule.get("condition", "")
@@ -260,32 +341,45 @@ def make_negative_pairs(rule, nvd_index, num_variants=3):
     if not absent or not cond:
         return []
 
-    primary = absent[0]
-    absent_block = "\n".join(
-        f"• {c}: {cve_summary(c, nvd_index, 90)}\n  Eliminated: shares root condition with {primary}"
-        for c in absent
-    )
-    still_block = "\n".join(
-        f"• {c}: {cve_summary(c, nvd_index, 90)}\n  Independent — not affected by '{cond}'"
-        for c in still
-    ) if still else "None — all co-dependent CVEs eliminated."
-
-    chain_reasoning = (
-        f"Condition '{cond}' removes the shared precondition for {', '.join(absent)}. "
-        f"{reason} "
-        f"CVEs with independent preconditions ({', '.join(still) if still else 'none here'}) "
-        f"are not transitively eliminated."
-    )
-
-    out_text = NEGATIVE_OUTPUT.format(
-        cve=primary, condition=cond, display=display, reason=reason,
-        absent_block=absent_block, still_block=still_block,
-        chain_reasoning=chain_reasoning,
-    ).strip()
-
     templates = random.sample(NEGATIVE_INPUTS, min(num_variants, len(NEGATIVE_INPUTS)))
     pairs = []
-    for tmpl in templates:
+    for vi, tmpl in enumerate(templates):
+        # Shuffle absent CVEs for output diversity
+        shuffled_absent = list(absent)
+        random.shuffle(shuffled_absent)
+        primary = shuffled_absent[0]
+
+        absent_block = "\n".join(
+            f"• {c}: {cve_summary(c, nvd_index, 90)}\n  Eliminated: shares root condition with {primary}"
+            for c in shuffled_absent
+        )
+        still_block = "\n".join(
+            f"• {c}: {cve_summary(c, nvd_index, 90)}\n  Independent — not affected by '{cond}'"
+            for c in still
+        ) if still else "None — all co-dependent CVEs eliminated."
+
+        chain_reasoning = (
+            f"Condition '{cond}' removes the shared precondition for {', '.join(shuffled_absent)}. "
+            f"{reason} "
+            f"CVEs with independent preconditions ({', '.join(still) if still else 'none here'}) "
+            f"are not transitively eliminated."
+        )
+
+        # Alternate between full and brief output format
+        if vi % 2 == 0:
+            out_text = NEGATIVE_OUTPUT.format(
+                cve=primary, condition=cond, display=display, reason=reason,
+                absent_block=absent_block, still_block=still_block,
+                chain_reasoning=chain_reasoning,
+            ).strip()
+        else:
+            out_text = (
+                f"Negative inference: {primary} ABSENT in {display}.\n"
+                f"Condition: {cond}\n{reason}\n\n"
+                f"Structurally eliminated (same root condition):\n{absent_block}\n\n"
+                f"Independent — still assess:\n{still_block}"
+            ).strip()
+
         pairs.append({
             "layer":  "vulnerability_cooccurrence",
             "type":   "negative_inference",
@@ -546,10 +640,170 @@ def make_conditional_pairs(profile_key, cond_label, cond_items, nvd_index, num_v
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TYPE 6: CWE cross-cluster hard negatives
+# ─────────────────────────────────────────────────────────────────────────────
+# Problem: hard negatives came only from ~12 stack profiles (~36 pairs).
+# Solution: generate negatives across structurally independent CWE clusters.
+# "Finding CWE-89 (input validation) does NOT imply CWE-416 (memory safety)."
+
+_CWE_NEG_CLUSTERS = {
+    "memory_safety":    {"cwes": ["CWE-416", "CWE-787", "CWE-125", "CWE-476", "CWE-190"],
+                         "desc": "memory safety issues (buffer overflows, UAF) in C/C++ native code"},
+    "input_validation": {"cwes": ["CWE-89", "CWE-79", "CWE-78", "CWE-94", "CWE-22"],
+                         "desc": "input validation failures (injection, XSS) in web applications"},
+    "auth_session":     {"cwes": ["CWE-287", "CWE-798", "CWE-384"],
+                         "desc": "authentication and session management weaknesses"},
+    "access_control":   {"cwes": ["CWE-862", "CWE-863"],
+                         "desc": "missing or incorrect authorization checks"},
+    "cryptographic":    {"cwes": ["CWE-327", "CWE-326"],
+                         "desc": "use of broken or weak cryptographic algorithms"},
+    "deserialization":  {"cwes": ["CWE-502"],
+                         "desc": "unsafe deserialization of untrusted data"},
+}
+
+CROSS_CWE_INPUTS = [
+    "We found {cve} ({trigger_cwe}, {trigger_cluster}). Does this mean {unrelated_cwe} ({unrelated_cluster}) vulnerabilities are also likely?",
+    "Assessment confirmed {cve} exploitable via {trigger_cwe}. Should we also test for {unrelated_cwe} ({unrelated_cluster})?",
+    "{cve} is classified as {trigger_cwe}. Is {unrelated_cwe} likely co-present in the same system?",
+]
+
+
+def make_cwe_cross_cluster_negatives(nvd_index, target=200):
+    """Generate hard negatives across structurally independent CWE clusters."""
+    # Build CWE → cluster index from NVD records
+    cwe_to_cluster = {}
+    for cn, info in _CWE_NEG_CLUSTERS.items():
+        for cwe in info["cwes"]:
+            cwe_to_cluster[cwe] = cn
+
+    cluster_cves: dict[str, list[str]] = defaultdict(list)
+    for cve_id, rec in nvd_index.items():
+        cwe = rec.get("cwe_id", "")
+        cl = cwe_to_cluster.get(cwe)
+        if cl:
+            cluster_cves[cl].append(cve_id)
+
+    pairs = []
+    cluster_names = list(_CWE_NEG_CLUSTERS.keys())
+
+    for i, ca in enumerate(cluster_names):
+        for cb in cluster_names[i + 1:]:
+            cves_a = cluster_cves.get(ca, [])
+            if not cves_a:
+                continue
+            cwes_a = _CWE_NEG_CLUSTERS[ca]["cwes"]
+            cwes_b = _CWE_NEG_CLUSTERS[cb]["cwes"]
+            desc_a = _CWE_NEG_CLUSTERS[ca]["desc"]
+            desc_b = _CWE_NEG_CLUSTERS[cb]["desc"]
+
+            sample = random.sample(cves_a, min(3, len(cves_a)))
+            for cve in sample:
+                t_cwe = random.choice(cwes_a)
+                u_cwe = random.choice(cwes_b)
+                tmpl = random.choice(CROSS_CWE_INPUTS)
+                inp = tmpl.format(
+                    cve=cve,
+                    trigger_cwe=t_cwe,
+                    trigger_cluster=ca.replace("_", " "),
+                    unrelated_cwe=u_cwe,
+                    unrelated_cluster=cb.replace("_", " "),
+                )
+                out = (
+                    f"No — finding {t_cwe} ({ca.replace('_', ' ')}) does not predict "
+                    f"{u_cwe} ({cb.replace('_', ' ')}).\n\n"
+                    f"CONFIRMED: {t_cwe} — {desc_a}\n"
+                    f"QUERIED:   {u_cwe} — {desc_b}\n\n"
+                    f"These weakness classes are structurally independent: different "
+                    f"root causes, different code layers, different exploitation "
+                    f"techniques. Finding {t_cwe} does NOT increase the probability "
+                    f"of {u_cwe}.\n\n"
+                    f"What IS likely alongside {t_cwe}: other "
+                    f"{ca.replace('_', ' ')} weaknesses — "
+                    f"{', '.join(c for c in cwes_a if c != t_cwe)}"
+                )
+                pairs.append({
+                    "layer":  "vulnerability_cooccurrence",
+                    "type":   "hard_negative_cwe",
+                    "input":  inp,
+                    "output": out,
+                    "metadata": {"trigger_cve": cve, "trigger_cluster": ca,
+                                 "absent_cluster": cb},
+                })
+                if len(pairs) >= target:
+                    log.info(f"    CWE cross-cluster negatives: {len(pairs)}")
+                    return pairs
+
+    log.info(f"    CWE cross-cluster negatives: {len(pairs)}")
+    return pairs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TYPE 7: OWASP independence hard negatives
+# ─────────────────────────────────────────────────────────────────────────────
+# Pairs of OWASP categories that are NOT strongly co-occurring.
+# Teaches the model to distinguish co-occurrence from mere co-existence.
+
+_OWASP_INDEPENDENCE = [
+    ("A03:2021-Injection", "A10:2021-Server-Side Request Forgery",
+     "Injection needs unsanitized query construction; SSRF needs URL-fetching functionality. Independent preconditions."),
+    ("A02:2021-Cryptographic Failures", "A10:2021-Server-Side Request Forgery",
+     "Cryptographic choices and SSRF are orthogonal — one is data protection, the other is request manipulation."),
+    ("A06:2021-Vulnerable and Outdated Components", "A04:2021-Insecure Design",
+     "Outdated components are patching failures; insecure design is architectural. Different teams, different processes."),
+    ("A09:2021-Security Logging and Monitoring Failures", "A03:2021-Injection",
+     "Logging gaps don't cause injection and injection doesn't cause logging gaps. Independent control failures."),
+    ("A08:2021-Software and Data Integrity Failures", "A07:2021-Identification and Authentication Failures",
+     "Supply chain integrity and authentication are separate security domains."),
+    ("A04:2021-Insecure Design", "A02:2021-Cryptographic Failures",
+     "Design flaws are architectural; crypto failures are implementation choices. Independent risk factors."),
+    ("A06:2021-Vulnerable and Outdated Components", "A10:2021-Server-Side Request Forgery",
+     "Running old components does not imply URL-fetching functionality exists. Unrelated surfaces."),
+    ("A08:2021-Software and Data Integrity Failures", "A03:2021-Injection",
+     "Deserialization/supply chain issues have different root causes from input injection."),
+]
+
+OWASP_NEG_INPUTS = [
+    "We confirmed {short_a} on the target. Does this mean {short_b} is also likely?",
+    "Audit finding: {cat_a}. Should we expect {cat_b} in the same application?",
+    "Assessment: {short_a} vulnerabilities found. Is {short_b} a co-occurring risk?",
+    "Confirmed: {short_a}. What is the probability of also finding {short_b}?",
+]
+
+
+def make_owasp_independence_negatives():
+    """Generate hard negatives between OWASP categories that are NOT co-occurring."""
+    pairs = []
+    for cat_a, cat_b, reasoning in _OWASP_INDEPENDENCE:
+        short_a = cat_a.split("-", 1)[-1].strip() if "-" in cat_a else cat_a
+        short_b = cat_b.split("-", 1)[-1].strip() if "-" in cat_b else cat_b
+
+        out = (
+            f"Low probability. {cat_a} and {cat_b} are NOT strongly co-occurring.\n\n"
+            f"{reasoning}\n\n"
+            f"These categories have independent root causes. Finding one does not meaningfully "
+            f"increase the probability of the other.\n\n"
+            f"Focus assessment time on categories that DO co-occur with {short_a} instead."
+        )
+        for tmpl in OWASP_NEG_INPUTS:
+            inp = tmpl.format(cat_a=cat_a, cat_b=cat_b,
+                              short_a=short_a, short_b=short_b)
+            pairs.append({
+                "layer":  "vulnerability_cooccurrence",
+                "type":   "hard_negative_owasp",
+                "input":  inp,
+                "output": out,
+                "metadata": {"cat_a": cat_a, "cat_b": cat_b},
+            })
+
+    log.info(f"    OWASP independence negatives: {len(pairs)}")
+    return pairs
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main generation  (FIXED — generates enough to hit target)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def generate_all_pairs(target_count=15000):
+def generate_all_pairs(target_count=60000):
     nvd_index              = load_nvd_index(NVD_FILE)
     all_pairs, neg_rules   = load_cooc(COOC_FILE)
 
@@ -590,6 +844,14 @@ def generate_all_pairs(target_count=15000):
         for cond_label, cond_items in profile.get("conditional", {}).items():
             pairs.extend(make_conditional_pairs(pk, cond_label, cond_items, nvd_index, num_variants=3))
 
+    # ── Type 6: CWE cross-cluster hard negatives (~200 pairs) ─────────────
+    log.info("  Generating Type 6: CWE cross-cluster hard negatives …")
+    pairs.extend(make_cwe_cross_cluster_negatives(nvd_index, target=200))
+
+    # ── Type 7: OWASP independence hard negatives (~32 pairs) ─────────────
+    log.info("  Generating Type 7: OWASP independence hard negatives …")
+    pairs.extend(make_owasp_independence_negatives())
+
     log.info(f"\n  Raw pairs before cap: {len(pairs):,}")
 
     # Dedup by (input first 100 chars)
@@ -627,7 +889,7 @@ def write_pairs(pairs, out_file=OUT_FILE):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--count",     type=int, default=15000)
+    parser.add_argument("--count",     type=int, default=60000)
     parser.add_argument("--output",    type=str, default=str(OUT_FILE))
     parser.add_argument("--no-append", action="store_true")
     args = parser.parse_args()

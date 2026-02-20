@@ -76,7 +76,7 @@ LAYER_CONTEXT: dict[str, str] = {
         "correlated to the given vulnerability. Reason about exploit chains, "
         "shared affected products, and campaign co-occurrence patterns."
     ),
-    "co_occurrence": (
+    "vulnerability_cooccurrence": (
         "You are a threat modeling expert. Given a vulnerability or OWASP category, "
         "identify which other vulnerability classes statistically co-occur in the same "
         "codebase or attack campaign, and explain the co-occurrence pattern."
@@ -153,7 +153,7 @@ def ask_model(
                      Options: vulnerability_intelligence | pentesting_intelligence |
                               risk_scoring | execution_context | audit_evidence |
                               remediation_learning | vulnerability_correlation |
-                              co_occurrence | general
+                              vulnerability_cooccurrence | general
 
     Returns:
         str: Model response text, or a clean error string if inference fails.

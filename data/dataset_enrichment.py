@@ -127,7 +127,12 @@ def enrich_with_correlations(record: dict, corr_lookup: dict) -> dict:
         record["related_vulnerabilities"] = corr.get("related_vulnerabilities", [])
         record["attack_techniques"]       = corr.get("attack_techniques", [])
         record["capec_patterns"]          = corr.get("capec_patterns", [])
-        record["correlation_signals"]     = corr.get("correlation_signal_count", 0)
+        raw_count = corr.get("correlation_signal_count", 0)
+        signal_breakdown = corr.get("signal_type_counts", {})
+        if signal_breakdown:
+            record["correlation_signals"] = signal_breakdown
+        else:
+            record["correlation_signals"] = raw_count
     return record
 
 

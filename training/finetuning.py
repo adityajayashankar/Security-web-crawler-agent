@@ -81,8 +81,8 @@ MIN_EVAL_EXAMPLES = 30     # min eval examples per layer
 # Layers receiving 3× oversample weight during training.
 # All unlisted layers default to weight = 1.0.
 LAYER_SAMPLE_WEIGHTS: dict[str, float] = {
-    "vulnerability_correlation": 3.0,
-    "co_occurrence":             3.0,
+    "vulnerability_correlation":  3.0,
+    "vulnerability_cooccurrence": 3.0,
     # Keep standard layers at 1× — they're already well-represented
     "vulnerability_intelligence": 1.0,
     "pentesting_intelligence":    1.0,
@@ -132,31 +132,81 @@ def load_pairs(path: Path) -> list[dict]:
     return pairs
 
 
-# ── Stratified split by layer ──────────────────────────────────────────────────
+# ── CVE-decontaminated stratified split ────────────────────────────────────────
+
+import re as _re
+_CVE_RE = _re.compile(r'(CVE-\d{4}-\d{4,}|GHSA-[a-z0-9-]+)')
+
+def _extract_cve(pair: dict) -> str:
+    """Extract CVE/GHSA ID from a training pair."""
+    cid = pair.get("cve_id", "")
+    if cid:
+        return cid
+    m = _CVE_RE.search(pair.get("instruction", ""))
+    return m.group(1) if m else ""
+
+
 def stratified_split(
     pairs: list[dict],
     eval_fraction: float = EVAL_FRACTION,
     min_eval: int = MIN_EVAL_EXAMPLES,
 ) -> tuple[list[dict], list[dict]]:
     """
-    Split train/eval so each layer contributes proportionally to eval.
-    Thin layers get at least min_eval examples (or all examples if fewer).
+    CVE-aware stratified split: all pairs for a given CVE go to either
+    train OR eval, never both.  This prevents eval recall inflation from
+    the model having seen the same CVE during training in another layer.
+
+    Algorithm:
+      1. Group pairs by CVE ID.
+      2. Randomly assign whole CVEs to eval until we hit the target fraction.
+      3. Non-CVE pairs (no extractable ID) split randomly as fallback.
     """
-    by_layer: dict[str, list[dict]] = defaultdict(list)
+    cve_pairs: dict[str, list[dict]] = defaultdict(list)
+    no_cve: list[dict] = []
+
     for p in pairs:
-        by_layer[p.get("layer", "general")].append(p)
+        cve = _extract_cve(p)
+        if cve:
+            cve_pairs[cve].append(p)
+        else:
+            no_cve.append(p)
+
+    # Shuffle CVE order, then greedily assign to eval
+    cve_ids = list(cve_pairs.keys())
+    random.shuffle(cve_ids)
+    total_with_cve = sum(len(ps) for ps in cve_pairs.values())
+    target_eval = max(min_eval, int(total_with_cve * eval_fraction))
+
+    eval_cves: set[str] = set()
+    eval_count = 0
+    for cve in cve_ids:
+        if eval_count >= target_eval:
+            break
+        eval_cves.add(cve)
+        eval_count += len(cve_pairs[cve])
 
     train_pairs, eval_pairs = [], []
-    for layer, items in by_layer.items():
-        random.shuffle(items)
-        n_eval = max(min_eval, int(len(items) * eval_fraction))
-        n_eval = min(n_eval, len(items))  # can't eval more than we have
-        eval_pairs  += items[:n_eval]
-        train_pairs += items[n_eval:]
+    for cve, ps in cve_pairs.items():
+        if cve in eval_cves:
+            eval_pairs.extend(ps)
+        else:
+            train_pairs.extend(ps)
+
+    # Non-CVE pairs: random split
+    random.shuffle(no_cve)
+    n_eval_nc = max(1, int(len(no_cve) * eval_fraction)) if no_cve else 0
+    eval_pairs.extend(no_cve[:n_eval_nc])
+    train_pairs.extend(no_cve[n_eval_nc:])
 
     random.shuffle(train_pairs)
     random.shuffle(eval_pairs)
-    print(f"  Split: {len(train_pairs):,} train  /  {len(eval_pairs):,} eval")
+
+    # Report decontamination stats
+    train_cves = {_extract_cve(p) for p in train_pairs} - {""}
+    eval_cves_actual = {_extract_cve(p) for p in eval_pairs} - {""}
+    overlap = train_cves & eval_cves_actual
+    print(f"  CVE-decontaminated split: {len(train_pairs):,} train  /  {len(eval_pairs):,} eval")
+    print(f"    Train CVEs: {len(train_cves):,}  |  Eval CVEs: {len(eval_cves_actual):,}  |  Overlap: {len(overlap)}")
     return train_pairs, eval_pairs
 
 

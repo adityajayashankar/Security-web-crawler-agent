@@ -207,12 +207,12 @@ def print_report(result: dict, max_tokens: int) -> None:
 
     # ── Correlation/co-occurrence readiness check ──────────────────────────────
     corr_count = layer_counts.get("vulnerability_correlation", 0)
-    cooc_count = layer_counts.get("co_occurrence", 0)
+    cooc_count = layer_counts.get("vulnerability_cooccurrence", 0)
     print(f"\n  Correlation/co-occurrence readiness (3× oversample):")
     corr_ok = corr_count >= MIN_CORRELATION_PAIRS
     cooc_ok = cooc_count >= MIN_COOCCURRENCE_PAIRS
-    print(f"    vulnerability_correlation: {corr_count:,}  {'✅' if corr_ok else f'⚠️  below recommended {MIN_CORRELATION_PAIRS}'}")
-    print(f"    co_occurrence:             {cooc_count:,}  {'✅' if cooc_ok else f'⚠️  below recommended {MIN_COOCCURRENCE_PAIRS}'}")
+    print(f"    vulnerability_correlation:  {corr_count:,}  {'✅' if corr_ok else f'⚠️  below recommended {MIN_CORRELATION_PAIRS}'}")
+    print(f"    vulnerability_cooccurrence: {cooc_count:,}  {'✅' if cooc_ok else f'⚠️  below recommended {MIN_COOCCURRENCE_PAIRS}'}")
     if not corr_ok or not cooc_ok:
         print(f"    → Run: python run_pipeline.py --correlate  to enrich these layers")
 

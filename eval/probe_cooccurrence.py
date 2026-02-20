@@ -652,12 +652,20 @@ def print_report(report: dict, model_name: str, baseline_report: dict | None = N
 
 def main():
     parser = argparse.ArgumentParser(description="Co-occurrence probe evaluation")
-    parser.add_argument("--model",       required=True,  help="Path or HF repo of model to evaluate")
-    parser.add_argument("--baseline",    default=None,   help="Optional Phase 1 model for comparison")
-    parser.add_argument("--output",      default="eval/probe_results.json", help="JSON output path")
-    parser.add_argument("--max-probes",  type=int, default=200, help="Max probes per type")
-    parser.add_argument("--owasp-only",  action="store_true", help="Run OWASP probes only (fastest)")
+    parser.add_argument("--model",        required=True,  help="Path or HF repo of model to evaluate")
+    parser.add_argument("--baseline",     default=None,   help="Optional Phase 1 model for comparison")
+    parser.add_argument("--include-base", action="store_true",
+                        help="Auto-compare against raw Foundation-Sec-8B (proves fine-tuning value)")
+    parser.add_argument("--output",       default="eval/probe_results.json", help="JSON output path")
+    parser.add_argument("--max-probes",   type=int, default=200, help="Max probes per type")
+    parser.add_argument("--owasp-only",   action="store_true", help="Run OWASP probes only (fastest)")
     args = parser.parse_args()
+
+    # --include-base sets baseline to the raw pre-trained model if not already set
+    BASE_MODEL_ID = "fdtn-ai/Foundation-Sec-8B"
+    if args.include_base and not args.baseline:
+        args.baseline = BASE_MODEL_ID
+        print(f"  --include-base: will compare against {BASE_MODEL_ID}")
 
     random.seed(RANDOM_SEED)
 

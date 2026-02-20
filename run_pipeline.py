@@ -393,7 +393,11 @@ def _run_step(step_def: dict, args) -> dict:
         # Temporarily clear sys.argv so sub-scripts' argparse doesn't
         # choke on run_pipeline.py's flags (e.g. --from-build)
         saved_argv = sys.argv
-        sys.argv = [step_def["import_"]]
+        # Pass --count for co-occurrence pair generation (step 16)
+        if step_def["step"] == 16:
+            sys.argv = [step_def["import_"], "--count", "60000"]
+        else:
+            sys.argv = [step_def["import_"]]
         try:
             fn(**kwargs)
         finally:
