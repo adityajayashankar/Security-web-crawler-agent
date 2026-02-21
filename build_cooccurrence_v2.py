@@ -260,24 +260,60 @@ def pairs_from_nvd_products(nvd_records, max_per_product=20):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Merge + deduplicate (keep highest-confidence version of each pair)
+# Merge + aggregate confidence across sources
 # ─────────────────────────────────────────────────────────────────────────────
+# Old behavior: keep only highest-confidence per pair → discards multi-source
+# evidence.  New behavior: aggregate via 1 - ∏(1 - conf_i) so pairs appearing
+# in multiple independent sources rank higher.
 
 def merge_pairs(*sources):
-    best = {}   # canonical_key → pair dict
+    # First pass: collect ALL evidence per canonical pair
+    evidence: dict[tuple, list[dict]] = defaultdict(list)
     for source in sources:
         for pair in source:
             a    = pair.get("cve_a", "")
             b    = pair.get("cve_b", "")
-            conf = pair.get("confidence", 0.0)
             if not a or not b:
                 continue
             key = tuple(sorted([a, b]))
-            if key not in best or best[key]["confidence"] < conf:
-                best[key] = pair
+            evidence[key].append(pair)
 
-    merged = list(best.values())
+    merged = []
+    for key, entries in evidence.items():
+        if len(entries) == 1:
+            # Single source — keep as-is
+            merged.append(entries[0])
+        else:
+            # Multi-source: aggregate confidence via 1 - ∏(1 - conf_i)
+            # and keep the richest metadata from the highest-confidence entry
+            confs = [e.get("confidence", 0.0) for e in entries]
+            product = 1.0
+            for c in confs:
+                product *= (1.0 - c)
+            aggregated_conf = round(min(1.0 - product, 0.99), 3)
+
+            # Use the highest-confidence entry as the base record
+            best = max(entries, key=lambda e: e.get("confidence", 0.0))
+            result = dict(best)
+            result["confidence"] = aggregated_conf
+
+            # Attach all contributing sources for transparency
+            all_sources = list({e.get("source", "unknown") for e in entries})
+            result["sources_combined"] = all_sources
+            result["source_count"] = len(all_sources)
+
+            # Append multi-source reason
+            source_summary = ", ".join(all_sources)
+            result["reason"] = (
+                f"{result.get('reason', '')} "
+                f"[multi-source: {source_summary} → aggregated {aggregated_conf:.3f}]"
+            ).strip()
+
+            merged.append(result)
+
     log.info(f"  Merged total unique pairs: {len(merged):,}")
+    multi = sum(1 for m in merged if m.get("source_count", 1) > 1)
+    log.info(f"  Multi-source pairs (boosted): {multi:,}")
     return merged
 
 

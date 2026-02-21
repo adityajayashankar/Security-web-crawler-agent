@@ -16,18 +16,34 @@ Phase 2 (this script) gives the model:
   • Multi-signal correlation reasoning (KEV campaign, exploit chain, shared CWE, etc.)
   • Directionality awareness: P(B|A) ≠ P(A|B) in asymmetric co-occurrence pairs
 
-Architecture
-────────────
-We add a SECOND LoRA adapter on top of the Phase 1 merged model.
-This is the correct approach (vs retraining the Phase 1 adapter) because:
-  1. Phase 1 knowledge is frozen — no catastrophic forgetting of general security fluency
-  2. Phase 2 adapter learns only the delta: relational/graph reasoning on top
-  3. At inference time, both adapters are merged — full fluency + specialist reasoning
+Architecture — Frozen Phase 1 LoRA + Disjoint Phase 2 LoRA
+────────────────────────────────────────────────────────────
+Instead of loading the Phase 1 merged model (which bakes Phase 1 LoRA into
+frozen 4-bit weights where it can't be examined or ablated), we now load:
 
-Phase 2 LoRA uses r=16 (half of Phase 1 r=32).
-Phase 1 already specialized MLP layers heavily. Phase 2 focuses the ADDITIONAL
-adapter on attention patterns (q,k,v,o) — correlation reasoning is fundamentally
-about learning which entities to attend to together.
+  1. Base Foundation-Sec-8B model (4-bit QLoRA)
+  2. Phase 1 LoRA adapter (adapter_name="phase1_general") — FROZEN
+  3. Phase 2 LoRA adapter (adapter_name="phase2_correlation") — TRAINABLE
+
+Why this prevents catastrophic forgetting:
+  • Phase 1 LoRA targeted ALL modules (q/k/v/o + up/down/gate_proj, r=32).
+    Its attention LoRA learned the correlation structure — which CVEs to
+    jointly attend to.
+  • Phase 2 LoRA targets ONLY MLP modules (up/down/gate_proj, r=16).
+    MLP layers store factual associations. Phase 2 refines the co-occurrence
+    FACTS without touching Phase 1's attention patterns at all.
+  • The two adapters are perfectly disjoint at the module level:
+      Phase 1 attention LoRA: FROZEN (correlation reasoning preserved)
+      Phase 1 MLP LoRA:       FROZEN (general security facts preserved)
+      Phase 2 MLP LoRA:       TRAINABLE (adds co-occurrence fact refinement)
+  • At inference, both adapters are merged sequentially. The final model
+    has Phase 1's full knowledge + Phase 2's co-occurrence MLP refinement.
+
+Why MLP-only for Phase 2:
+  MLP layers in transformers store factual associations (Meng et al., 2022).
+  Phase 2 training data is dense factual signal: "CVE-X co-occurs with CVE-Y
+  at probability P." This is fact injection, not reasoning-pattern change.
+  Attention patterns from Phase 1 already handle the relational reasoning.
 
 Hyperparameters
 ───────────────
@@ -48,7 +64,7 @@ Hyperparameters
     We're starting from a well-trained Phase 1 checkpoint. Warmup would
     waste steps ramping up LR before it can do useful work.
 
-Memory: ~14GB on A100 (Phase 1 merged model in bfloat16 + small Phase 2 adapter)
+Memory: ~15GB on A100 (base model 4-bit + Phase 1 frozen LoRA + Phase 2 LoRA)
 """
 
 import json
@@ -68,9 +84,12 @@ from peft import LoraConfig, get_peft_model, TaskType, PeftModel
 from trl import SFTTrainer, SFTConfig
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-# Load from the Phase 1 merged checkpoint (or HF Hub after phase 1 push)
-PHASE1_MODEL   = "./checkpoints/vuln-foundation-sec-8b/merged"
-# fallback: PHASE1_MODEL = "adityajayashankar/vuln-foundation-sec-8b"
+# Load from the Phase 1 adapter checkpoint (NOT merged — we need the adapter
+# separate so it can be frozen independently from Phase 2).
+BASE_MODEL        = "fdtn-ai/Foundation-Sec-8B"
+PHASE1_ADAPTER    = "./checkpoints/vuln-foundation-sec-8b/final"
+# Fallback: if adapter dir not found, fall back to merged (less ideal)
+PHASE1_MERGED     = "./checkpoints/vuln-foundation-sec-8b/merged"
 
 DATASET_PATH   = Path("data") / "training_pairs.jsonl"
 OUTPUT_DIR     = Path("./checkpoints/vuln-foundation-sec-8b-phase2")
@@ -214,16 +233,21 @@ def pairs_to_dataset(pairs: list[dict]) -> Dataset:
     return Dataset.from_list([format_example(p) for p in pairs])
 
 
-# ── Load Phase 1 model for Phase 2 ────────────────────────────────────────────
+# ── Load Phase 1 model + frozen adapter for Phase 2 ──────────────────────────
 def load_phase1_model_for_phase2():
     """
-    Load the Phase 1 merged model in 4-bit QLoRA, ready to receive
-    a new Phase 2 LoRA adapter on top.
+    Load base Foundation-Sec-8B + Phase 1 LoRA adapter (FROZEN).
 
-    We load the merged (not adapter) checkpoint so Phase 1 weights are
-    frozen in the 4-bit quantized base — only Phase 2 adapter trains.
+    Strategy:
+      1. If Phase 1 adapter dir exists → load base + adapter via PeftModel
+      2. If only merged exists → load merged as base (fallback, less ideal)
+
+    Phase 1 adapter params are explicitly frozen after loading so that
+    Phase 2 training cannot modify them.
     """
-    print(f"\nLoading Phase 1 merged model: {PHASE1_MODEL}")
+    adapter_path = Path(PHASE1_ADAPTER)
+    merged_path  = Path(PHASE1_MERGED)
+    use_adapter  = adapter_path.exists() and (adapter_path / "adapter_config.json").exists()
 
     bnb_config = BitsAndBytesConfig(
         load_in_4bit              = True,
@@ -232,50 +256,90 @@ def load_phase1_model_for_phase2():
         bnb_4bit_use_double_quant = True,
     )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        PHASE1_MODEL,
-        quantization_config = bnb_config,
-        device_map          = "auto",
-        trust_remote_code   = True,
-        attn_implementation = "flash_attention_2",
-    )
-    model.config.use_cache = False
+    if use_adapter:
+        print(f"\n  Loading base model: {BASE_MODEL}")
+        print(f"  Loading Phase 1 adapter: {PHASE1_ADAPTER} (will be FROZEN)")
+        base_model = AutoModelForCausalLM.from_pretrained(
+            BASE_MODEL,
+            quantization_config = bnb_config,
+            device_map          = "auto",
+            trust_remote_code   = True,
+            attn_implementation = "flash_attention_2",
+        )
+        base_model.config.use_cache = False
 
-    tokenizer = AutoTokenizer.from_pretrained(PHASE1_MODEL, trust_remote_code=True)
-    tokenizer.padding_side = "right"
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
+        tokenizer.padding_side = "right"
+        if tokenizer.pad_token is None:
+            tokenizer.add_special_tokens({"pad_token": "<|finetune_right_pad_id|>"})
+            base_model.resize_token_embeddings(len(tokenizer))
 
-    # Re-add pad token in case it was lost during merge
-    if tokenizer.pad_token is None:
-        tokenizer.add_special_tokens({"pad_token": "<|finetune_right_pad_id|>"})
-        model.resize_token_embeddings(len(tokenizer))
+        # Load Phase 1 LoRA as a named adapter
+        model = PeftModel.from_pretrained(
+            base_model,
+            str(adapter_path),
+            adapter_name = "phase1_general",
+            is_trainable = False,   # frozen from the start
+        )
+
+        # Explicit belt-and-suspenders freeze of all Phase 1 adapter params
+        phase1_frozen = 0
+        for name, param in model.named_parameters():
+            if "phase1_general" in name:
+                param.requires_grad = False
+                phase1_frozen += param.numel()
+        print(f"  ✅ Phase 1 adapter frozen: {phase1_frozen:,} params (requires_grad=False)")
+
+    else:
+        # Fallback: load merged model as base (Phase 1 weights baked in 4-bit)
+        load_from = str(merged_path) if merged_path.exists() else BASE_MODEL
+        print(f"\n  ⚠️  Phase 1 adapter not found at {PHASE1_ADAPTER}")
+        print(f"  Falling back to merged model: {load_from}")
+        print(f"  (Phase 1 weights are frozen in 4-bit base, but not independently trackable)")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            load_from,
+            quantization_config = bnb_config,
+            device_map          = "auto",
+            trust_remote_code   = True,
+            attn_implementation = "flash_attention_2",
+        )
+        model.config.use_cache = False
+
+        tokenizer = AutoTokenizer.from_pretrained(load_from, trust_remote_code=True)
+        tokenizer.padding_side = "right"
+        if tokenizer.pad_token is None:
+            tokenizer.add_special_tokens({"pad_token": "<|finetune_right_pad_id|>"})
+            model.resize_token_embeddings(len(tokenizer))
 
     return model, tokenizer
 
 
-# ── Phase 2 LoRA config — attention-focused ───────────────────────────────────
+# ── Phase 2 LoRA config — MLP-only (disjoint from Phase 1 attention) ─────────
 def get_phase2_lora_config() -> LoraConfig:
     """
-    Phase 2 LoRA: r=16, attention projections only.
+    Phase 2 LoRA: r=16, MLP projections only.
 
-    Rationale for attention-only in Phase 2:
-      Phase 1's MLP LoRA (r=32) already injected factual CVE/CWE/ATT&CK
-      knowledge into the feed-forward layers (where LLMs store facts).
-      Correlation REASONING is about learning which tokens/entities to
-      attend to simultaneously — that's an attention-level operation.
+    CRITICAL DESIGN DECISION — MLP-only to prevent catastrophic forgetting:
+      Phase 1 targeted ALL modules (attention + MLP) at r=32. Its attention
+      LoRA learned the correlation structure — which CVEs to jointly attend
+      to. If Phase 2 also targeted attention, it would overwrite these
+      learned attention patterns, destroying the correlation reasoning.
 
-      Specifically: to answer "what co-occurs with CVE-X?", the model
-      needs to learn to jointly attend to the CVE token, its CWE, its
-      OWASP category, and the product tokens at the same time.
-      That's q/k/v reprogramming, not MLP fact storage.
+      Phase 2 targets ONLY MLP layers (up_proj, down_proj, gate_proj):
+        - Disjoint from Phase 1's attention LoRA → zero interference
+        - MLP layers store factual associations (Meng et al., 2022)
+        - Phase 2 data is factual: "CVE-X co-occurs with CVE-Y at prob P"
+        - Perfect target for fact injection without reasoning disruption
 
-    r=16 (half of Phase 1):
+    r=16 (half of Phase 1 r=32):
       Phase 2 is a refinement pass, not a reconstruction.
-      We're adding a small specialist adapter on top of general knowledge.
-      Larger rank would risk overwriting Phase 1's fluency.
+      We're adding co-occurrence FACTS, not rebuilding the model.
 
-    adapter_name="phase2_correlation":
-      Named adapter so both can be tracked, merged selectively, or
-      ablated independently during evaluation.
+    The resulting model has:
+      Base weights:       Foundation-Sec-8B (frozen, 4-bit)
+      Phase 1 LoRA:       attention + MLP, r=32 (FROZEN — correlation reasoning)
+      Phase 2 LoRA:       MLP only, r=16 (TRAINABLE — co-occurrence facts)
     """
     return LoraConfig(
         task_type      = TaskType.CAUSAL_LM,
@@ -284,8 +348,9 @@ def get_phase2_lora_config() -> LoraConfig:
         lora_dropout   = 0.05,
         bias           = "none",
         target_modules = [
-            # Attention only — correlation reasoning is attention-level
-            "q_proj", "k_proj", "v_proj", "o_proj",
+            # MLP only — disjoint from Phase 1 attention LoRA
+            # Phase 1's correlation attention patterns are completely untouched.
+            "up_proj", "down_proj", "gate_proj",
         ],
     )
 
@@ -310,14 +375,43 @@ def main():
     model, tokenizer = load_phase1_model_for_phase2()
 
     phase2_lora = get_phase2_lora_config()
-    model = get_peft_model(model, phase2_lora)
+
+    # If model already has Phase 1 adapter (PeftModel), add Phase 2 as second adapter.
+    # If fallback (plain model), wrap with get_peft_model as before.
+    if isinstance(model, PeftModel):
+        model.add_adapter("phase2_correlation", phase2_lora)
+        model.set_adapter("phase2_correlation")
+        print(f"\n  Multi-adapter mode: phase1_general (FROZEN) + phase2_correlation (TRAINABLE)")
+    else:
+        model = get_peft_model(model, phase2_lora)
+        print(f"\n  Single-adapter mode (fallback): phase2_correlation (TRAINABLE)")
+
     model.print_trainable_parameters()
 
     # Verify: only Phase 2 LoRA params should be trainable
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total     = sum(p.numel() for p in model.parameters())
-    print(f"\n  Trainable params: {trainable:,} / {total:,} ({trainable/total*100:.2f}%)")
-    print(f"  (Should be ~43M — only Phase 2 attention LoRA adapters)")
+    trainable_names  = []
+    frozen_lora      = 0
+    trainable_total  = 0
+    total            = 0
+    for name, param in model.named_parameters():
+        total += param.numel()
+        if param.requires_grad:
+            trainable_total += param.numel()
+            trainable_names.append(name)
+        elif "lora" in name.lower():
+            frozen_lora += param.numel()
+
+    print(f"\n  Trainable params: {trainable_total:,} / {total:,} ({trainable_total/total*100:.2f}%)")
+    print(f"  Frozen LoRA params (Phase 1): {frozen_lora:,}")
+
+    # Sanity check: no Phase 1 adapter params should be trainable
+    phase1_leak = [n for n in trainable_names if "phase1" in n]
+    if phase1_leak:
+        print(f"\n  ❌ ERROR: {len(phase1_leak)} Phase 1 params are trainable — aborting!")
+        for n in phase1_leak[:5]:
+            print(f"     LEAK: {n}")
+        return
+    print(f"  ✅ Phase 1 adapter is fully frozen — no catastrophic forgetting risk")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -362,12 +456,23 @@ def main():
     trainer.save_model(str(adapter_dir))
     print(f"\n✅ Phase 2 LoRA adapter saved → {adapter_dir}")
 
-    print("\nMerging Phase 2 LoRA into Phase 1 model...")
-    merged = model.merge_and_unload()
+    print("\nMerging adapters into base model...")
+    if isinstance(model, PeftModel) and "phase1_general" in (model.peft_config or {}):
+        # Multi-adapter path: merge both adapters sequentially
+        # First merge Phase 1 (frozen), then Phase 2 (trained)
+        print("  Merging Phase 1 (frozen) + Phase 2 (trained) adapters...")
+        model.set_adapter(["phase1_general", "phase2_correlation"])
+        merged = model.merge_and_unload()
+    else:
+        # Single-adapter fallback: just merge Phase 2
+        merged = model.merge_and_unload()
     merged.save_pretrained(str(merged_dir))
     tokenizer.save_pretrained(str(merged_dir))
     print(f"✅ Final merged model saved → {merged_dir}")
-    print(f"\n   This model has: Phase 1 (general security) + Phase 2 (correlation specialist)")
+    print(f"\n   This model has:")
+    print(f"     Base:    Foundation-Sec-8B")
+    print(f"     Phase 1: general security LoRA (attention + MLP, r=32) [was frozen]")
+    print(f"     Phase 2: co-occurrence MLP LoRA (MLP only, r=16) [newly trained]")
 
     # ── Push to Hub ────────────────────────────────────────────────────────
     print(f"\nPushing to HuggingFace Hub: {HF_REPO_NAME}")

@@ -33,6 +33,170 @@ OUTPUT_PATH = Path("data") / "training_pairs.jsonl"
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  TEMPLATE PERTURBATION / PARAPHRASING ENGINE
+# ═════════════════════════════════════════════════════════════════════════════
+# To prevent the model from memorizing rigid templates, we apply randomised
+# transformations: instruction rewording, sentence reordering, terminology
+# swaps, and realistic noise injection.
+
+# Instruction paraphrase pools — keyed by semantic intent
+_INSTRUCTION_VARIANTS = {
+    "how_fix": [
+        "How do I fix {cwe} ({cve}) in my application?",
+        "What's the remediation for {cwe} ({cve})?",
+        "Our scanner found {cve} ({cwe}). How do we patch it?",
+        "Recommend a fix for {cwe} vulnerability {cve}.",
+        "We've been flagged for {cve} ({cwe}). What's the remediation path?",
+        "How should I address {cwe} ({cve}) in production?",
+    ],
+    "root_cause": [
+        "What is the root cause of {cve} and how should it be permanently resolved?",
+        "Explain why {cve} ({cwe}) happens and how to eliminate it for good.",
+        "What underlying pattern causes {cve}? How do we prevent recurrence?",
+        "Break down the root cause of {cve} ({cwe}) and permanent fix.",
+        "Why does {cve} keep happening and how do we stop it?",
+    ],
+    "verify_fix": [
+        "After patching {cve} ({cwe}), how do I verify the fix is effective?",
+        "How can I confirm {cve} ({cwe}) is actually fixed?",
+        "What tests validate that the patch for {cve} works?",
+        "Post-patch verification steps for {cve} ({cwe})?",
+        "How do I test that {cve} ({cwe}) can no longer be exploited?",
+    ],
+    "priority": [
+        "How urgently should {cve} (CVSS {cvss}) be patched, and what's the remediation plan?",
+        "What's the patch priority for {cve} with CVSS {cvss}?",
+        "Given CVSS {cvss}, how fast do we need to remediate {cve}?",
+        "Prioritize patching for {cve} (CVSS {cvss}) — what's the plan?",
+        "Triage {cve} (CVSS {cvss}): urgency and remediation steps?",
+    ],
+    "standard_remediation": [
+        "What is the standard remediation for {cwe} vulnerabilities?",
+        "How are {cwe} vulnerabilities typically fixed?",
+        "Best practices for remediating {cwe}?",
+        "What's the industry-standard fix for {cwe}?",
+        "Standard approach to resolving {cwe} weaknesses?",
+    ],
+    "detect_cwe": [
+        "How do I detect {cwe} vulnerabilities in my codebase?",
+        "What tools and methods find {cwe} issues?",
+        "How can I identify {cwe} weaknesses in our application?",
+        "Detection strategy for {cwe} in a codebase?",
+        "How do I scan for {cwe} in source code and running apps?",
+    ],
+    "tool_selection": [
+        "We are performing a security assessment of a {stack} application. What tools and methodology should we use?",
+        "What's the right toolset for pentesting a {stack} deployment?",
+        "Recommend security assessment tools for a {stack} environment.",
+        "How should we approach security testing of our {stack} application?",
+        "What tools and methodology for auditing a {stack} stack?",
+    ],
+    "common_vulns": [
+        "What are the most common security vulnerabilities in {stack} applications?",
+        "Top security risks in {stack} environments?",
+        "What vulnerabilities should I prioritize when testing {stack}?",
+        "Common attack vectors against {stack} applications?",
+        "What security weaknesses are typical in {stack} deployments?",
+    ],
+    "env_risks": [
+        "What environment-specific security risks should I check for in a {stack} deployment?",
+        "What misconfigurations are common in {stack} production environments?",
+        "Environment security checklist for {stack}?",
+        "What deployment-specific risks affect {stack} applications?",
+        "Operational security risks specific to {stack}?",
+    ],
+    "recon_indicators": [
+        "During reconnaissance, I've identified a target is running {stack}. What indicators confirm this and what attack surface does it expose?",
+        "How do I fingerprint and enumerate the attack surface of a {stack} target?",
+        "I've found a {stack} instance. What should I probe first?",
+        "Confirming {stack} stack identification — what indicators and what's exposed?",
+        "Recon confirmed {stack}. What attack surface should I map?",
+    ],
+    "test_cve_env": [
+        "We need to test for {cve} in an environment running {sw}. What is the testing approach?",
+        "How do I validate whether {cve} is exploitable in our {sw} deployment?",
+        "Testing methodology for {cve} on {sw}?",
+        "What's the approach to check if {cve} affects our {sw} instance?",
+        "How should we test our {sw} environment for {cve}?",
+    ],
+}
+
+# Terminology synonym pools for output perturbation
+_TERM_SWAPS = {
+    "**Fix:**":        ["**Remediation:**", "**Solution:**", "**Resolution:**", "**Mitigation:**"],
+    "**Root Cause:**": ["**Underlying Issue:**", "**Why This Happens:**", "**Core Problem:**"],
+    "**Control Type:**": ["**Security Control:**", "**Defense Layer:**", "**Control Category:**"],
+    "**Code Example:**": ["**Code Pattern:**", "**Implementation Example:**", "**Before/After:**"],
+    "**Verification:**": ["**Validation:**", "**Testing:**", "**Confirm Fix:**"],
+    "**Tools:**":      ["**Recommended Tools:**", "**Useful Tools:**", "**Analysis Tools:**"],
+    "**Primary risk:**": ["**Main risk:**", "**Key risk:**", "**Top concern:**"],
+    "**Primary tool:**": ["**Lead tool:**", "**Main tool:**", "**Start with:**"],
+}
+
+# Noise injections — realistic additions that precede or follow content
+_NOISE_PREFIXES = [
+    "",  # No noise (most common)
+    "",
+    "",
+    "Note: Always test in a non-production environment first.\n\n",
+    "Important: Back up your configuration before applying changes.\n\n",
+    "Context: This applies to the default installation. Custom configurations may differ.\n\n",
+]
+
+_NOISE_SUFFIXES = [
+    "",
+    "",
+    "",
+    "\n\nNote: Re-run your security scanner after applying the fix to confirm resolution.",
+    "\n\nTip: Add this check to your CI/CD pipeline to prevent regression.",
+    "\n\nReminder: Document the remediation in your vulnerability tracking system.",
+]
+
+
+def _pick_instruction(intent: str, **kwargs) -> str:
+    """Pick a random paraphrased instruction for the given intent."""
+    variants = _INSTRUCTION_VARIANTS.get(intent, [])
+    if not variants:
+        return ""
+    template = random.choice(variants)
+    try:
+        return template.format(**kwargs)
+    except KeyError:
+        return template
+
+
+def _perturb_output(text: str) -> str:
+    """Apply random terminology swaps, reordering, and noise to output text."""
+    # Terminology swaps (each swap has 40% chance)
+    for original, alternatives in _TERM_SWAPS.items():
+        if original in text and random.random() < 0.4:
+            text = text.replace(original, random.choice(alternatives), 1)
+
+    # Sentence-level reordering within paragraphs (20% chance per paragraph)
+    paragraphs = text.split("\n\n")
+    perturbed_paragraphs = []
+    for para in paragraphs:
+        lines = para.split("\n")
+        # Only reorder bullet-point lines (those starting with "  " or "  -")
+        bullet_lines = [l for l in lines if l.strip().startswith("-") or l.strip().startswith(("1.", "2.", "3.", "4.", "5."))]
+        if len(bullet_lines) >= 3 and random.random() < 0.2:
+            # Shuffle interior bullets only (keep first as-is for coherence)
+            non_bullets = [l for l in lines if l not in bullet_lines]
+            random.shuffle(bullet_lines)
+            lines = non_bullets + bullet_lines
+        perturbed_paragraphs.append("\n".join(lines))
+    text = "\n\n".join(perturbed_paragraphs)
+
+    # Noise injection (15% chance)
+    if random.random() < 0.15:
+        text = random.choice(_NOISE_PREFIXES) + text
+    if random.random() < 0.15:
+        text = text + random.choice(_NOISE_SUFFIXES)
+
+    return text
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  REMEDIATION KNOWLEDGE BASE  (18 CWEs — was 5)
 # ═════════════════════════════════════════════════════════════════════════════
 REMEDIATION_KB: dict[str, dict] = {
@@ -408,9 +572,9 @@ def generate_remediation_pairs(nvd_records: list) -> list:
 
             # Pair 1: direct fix request
             pairs.append({
-                "instruction": f"How do I fix {cwe} ({cve_id}) in my application?",
+                "instruction": _pick_instruction("how_fix", cwe=cwe, cve=cve_id),
                 "input":       desc,
-                "output": (
+                "output": _perturb_output(
                     f"Remediation for {cwe} ({cve_id}):\n\n"
                     f"**Fix:** {kb['fix']}\n\n"
                     f"**Root Cause:** {kb['root_cause']}\n\n"
@@ -427,9 +591,9 @@ def generate_remediation_pairs(nvd_records: list) -> list:
 
             # Pair 2: root cause analysis
             pairs.append({
-                "instruction": f"What is the root cause of {cve_id} and how should it be permanently resolved?",
+                "instruction": _pick_instruction("root_cause", cve=cve_id, cwe=cwe),
                 "input":       desc,
-                "output": (
+                "output": _perturb_output(
                     f"Root Cause Analysis for {cve_id} ({cwe}):\n\n"
                     f"**Root Cause:** {kb['root_cause']}\n\n"
                     f"**Why it persists:** This class of vulnerability ({cwe}) recurs because developers "
@@ -445,9 +609,9 @@ def generate_remediation_pairs(nvd_records: list) -> list:
 
             # Pair 3: post-patch verification
             pairs.append({
-                "instruction": f"After patching {cve_id} ({cwe}), how do I verify the fix is effective?",
+                "instruction": _pick_instruction("verify_fix", cve=cve_id, cwe=cwe),
                 "input":       desc,
-                "output": (
+                "output": _perturb_output(
                     f"Verification testing for {cwe} fix ({cve_id}):\n\n"
                     f"**Test payloads to confirm patch blocks attack:**\n"
                     + "\n".join(f"  {i+1}. {p}" for i, p in enumerate(kb['test_payloads']))
@@ -462,9 +626,9 @@ def generate_remediation_pairs(nvd_records: list) -> list:
 
             # Pair 4: CVSS-aware prioritisation guidance
             pairs.append({
-                "instruction": f"How urgently should {cve_id} (CVSS {cvss}) be patched, and what's the remediation plan?",
+                "instruction": _pick_instruction("priority", cve=cve_id, cwe=cwe, cvss=cvss),
                 "input":       desc,
-                "output": (
+                "output": _perturb_output(
                     f"Patch Priority Assessment for {cve_id}:\n\n"
                     f"**CVSS Score:** {cvss} — {'CRITICAL: patch within 24 hours' if float(cvss) >= 9.0 else 'HIGH: patch within 7 days' if float(cvss) >= 7.0 else 'MEDIUM: patch within 30 days'}\n\n"
                     f"**Remediation Plan:**\n"
@@ -480,9 +644,9 @@ def generate_remediation_pairs(nvd_records: list) -> list:
 
         # CWE-level pairs (no specific CVE grounding — teaches class-level questions)
         pairs.append({
-            "instruction": f"What is the standard remediation for {cwe} vulnerabilities?",
+            "instruction": _pick_instruction("standard_remediation", cwe=cwe),
             "input":       "",
-            "output": (
+            "output": _perturb_output(
                 f"Standard remediation for {cwe}:\n\n"
                 f"**Fix:** {kb['fix']}\n\n"
                 f"**Root Cause Pattern:** {kb['root_cause']}\n\n"
@@ -498,9 +662,9 @@ def generate_remediation_pairs(nvd_records: list) -> list:
         })
 
         pairs.append({
-            "instruction": f"How do I detect {cwe} vulnerabilities in my codebase?",
+            "instruction": _pick_instruction("detect_cwe", cwe=cwe),
             "input":       "",
-            "output": (
+            "output": _perturb_output(
                 f"Detection strategy for {cwe}:\n\n"
                 f"**SAST (Static Analysis):** Run {kb['tools'][-1]} on your codebase. Look for the pattern:\n"
                 f"  {kb['before']}\n\n"
@@ -544,9 +708,9 @@ def generate_execution_context_pairs(nvd_records: list) -> list:
 
         # Pair 1: tool selection for stack
         pairs.append({
-            "instruction": f"We are performing a security assessment of a {stack} application. What tools and methodology should we use?",
+            "instruction": _pick_instruction("tool_selection", stack=stack),
             "input":       "",
-            "output": (
+            "output": _perturb_output(
                 f"Security assessment methodology for {stack}:\n\n"
                 f"**Primary tool:** {tools[0]} — {approach.split('.')[0]}.\n"
                 f"**Secondary:** {tools[1] if len(tools) > 1 else tools[0]} — for {focus[0]} testing.\n"
@@ -560,9 +724,9 @@ def generate_execution_context_pairs(nvd_records: list) -> list:
 
         # Pair 2: what to look for / common vulnerabilities
         pairs.append({
-            "instruction": f"What are the most common security vulnerabilities in {stack} applications?",
+            "instruction": _pick_instruction("common_vulns", stack=stack),
             "input":       "",
-            "output": (
+            "output": _perturb_output(
                 f"Common vulnerabilities in {stack}:\n\n"
                 + "\n".join(f"  {i+1}. **{v}**" for i, v in enumerate(focus))
                 + f"\n\n**Testing approach:** {approach}\n\n"
@@ -574,9 +738,9 @@ def generate_execution_context_pairs(nvd_records: list) -> list:
 
         # Pair 3: environment-specific risks
         pairs.append({
-            "instruction": f"What environment-specific security risks should I check for in a {stack} deployment?",
+            "instruction": _pick_instruction("env_risks", stack=stack),
             "input":       "",
-            "output": (
+            "output": _perturb_output(
                 f"Environment risk checklist for {stack}:\n\n"
                 f"**Primary risk:** {env_risks}\n\n"
                 f"**Indicators of misconfiguration:**\n"
@@ -589,9 +753,9 @@ def generate_execution_context_pairs(nvd_records: list) -> list:
 
         # Pair 4: detection indicators
         pairs.append({
-            "instruction": f"During reconnaissance, I've identified a target is running {stack}. What indicators confirm this and what attack surface does it expose?",
+            "instruction": _pick_instruction("recon_indicators", stack=stack),
             "input":       "",
-            "output": (
+            "output": _perturb_output(
                 f"Fingerprinting and attack surface for {stack}:\n\n"
                 f"**Confirmation indicators:**\n"
                 + "\n".join(f"  - {ind}" for ind in indicators)
@@ -616,9 +780,9 @@ def generate_execution_context_pairs(nvd_records: list) -> list:
             continue
 
         pairs.append({
-            "instruction": f"We need to test for {cve_id} in an environment running {sw_name}. What is the testing approach?",
+            "instruction": _pick_instruction("test_cve_env", cve=cve_id, sw=sw_name),
             "input":       desc,
-            "output": (
+            "output": _perturb_output(
                 f"Testing approach for {cve_id} in {sw_name} environment:\n\n"
                 f"1. **Confirm version:** Verify {sw_name} version is in the affected range for {cve_id}.\n"
                 f"2. **Set up test environment:** Mirror the production stack with the same {sw_name} version.\n"

@@ -25,6 +25,8 @@ import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+from crawl_cache import is_stale, record_count
+
 # ── MITRE ATT&CK STIX bundle ──────────────────────────────────────────────────
 ATTACK_STIX_URL = (
     "https://raw.githubusercontent.com/mitre-attack/attack-stix-data/"
@@ -382,6 +384,12 @@ def build_cve_to_techniques(
 def run(out: str | None = None):
     # FIX: use Path for output to avoid Windows separator bugs
     out_path = Path(out) if out else Path("data") / "raw_mitre_attack.json"
+
+    # ── Cache staleness check (same pattern as crawl_nvd.py) ────────────
+    if not is_stale(out_path):
+        cached = record_count(out_path)
+        print(f"  ✅ MITRE ATT&CK cache is fresh — skipping fetch ({cached:,} records on disk)")
+        return
 
     all_records = []
 

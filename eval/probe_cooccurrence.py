@@ -84,8 +84,9 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline as hf_pipeline
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
-COOCCURRENCE_PATH = Path("data") / "raw_cooccurrence.json"
-CORRELATIONS_PATH = Path("data") / "raw_correlations.json"
+COOCCURRENCE_PATH    = Path("data") / "raw_cooccurrence.json"
+CORRELATIONS_PATH    = Path("data") / "raw_correlations.json"
+STACK_PROFILES_PATH  = Path("stack_profiles.py")  # imported dynamically for negative rules
 
 # ── Evaluation config ──────────────────────────────────────────────────────────
 RECALL_K          = [3, 5, 10]
@@ -360,6 +361,105 @@ def build_directional_probes(cooc_data: dict, max_probes: int) -> list[Probe]:
             ))
 
     random.shuffle(probes)
+    return probes[:max_probes]
+
+
+# ── Negative probes (using stack profile negative_rules) ──────────────────────
+
+def _load_stack_profiles() -> dict:
+    """
+    Import STACK_PROFILES from stack_profiles.py.
+    Uses importlib so the eval script doesn't hard-depend on the module at
+    import time (it may not be on sys.path in all invocations).
+    """
+    import importlib.util, sys
+    # Try direct import first (works when cwd is repo root)
+    try:
+        from stack_profiles import STACK_PROFILES
+        return STACK_PROFILES
+    except ImportError:
+        pass
+    # Fallback: load by path
+    spec_path = STACK_PROFILES_PATH
+    if not spec_path.exists():
+        spec_path = Path.cwd() / "stack_profiles.py"
+    if not spec_path.exists():
+        return {}
+    spec = importlib.util.spec_from_file_location("stack_profiles", str(spec_path))
+    mod  = importlib.util.module_from_spec(spec)
+    sys.modules["stack_profiles"] = mod
+    spec.loader.exec_module(mod)
+    return getattr(mod, "STACK_PROFILES", {})
+
+
+def build_negative_probes(max_probes: int) -> list[Probe]:
+    """
+    Build NEGATIVE probes — present the model with CVE pairs that are
+    explicitly NOT correlated, and verify the model says so.
+
+    Ground truth source: ``negative_rules`` in stack_profiles.py.
+    Each negative_rule defines:
+      - condition:   when a mitigation is applied
+      - absent_cves: CVEs that are absent under that condition
+      - reason:      why they're absent
+
+    For each profile, we pair the ``high_confidence`` CVEs (which ARE
+    present) with the ``absent_cves`` from each negative rule, and ask
+    the model whether the absent CVEs co-occur. The correct answer is NO.
+
+    This directly tests whether the model learned conditional absence,
+    not just positive co-occurrence.
+    """
+    profiles = _load_stack_profiles()
+    if not profiles:
+        print("  ⚠️  Could not load STACK_PROFILES — skipping negative probes")
+        return []
+
+    probes: list[Probe] = []
+
+    for profile_key, profile in profiles.items():
+        display   = profile.get("display_name", profile_key)
+        hc_cves   = [e["cve"] for e in profile.get("high_confidence", [])]
+        neg_rules = profile.get("negative_rules", [])
+
+        if not hc_cves or not neg_rules:
+            continue
+
+        for i, rule in enumerate(neg_rules):
+            condition  = rule.get("condition", "")
+            absent     = rule.get("absent_cves", [])
+            reason     = rule.get("reason", "")
+            still_ok   = rule.get("still_assess", [])
+
+            if not absent:
+                continue
+
+            # Pick one high-confidence CVE as the "anchor" that IS present
+            anchor = hc_cves[0]
+
+            # The model should NOT claim these absent CVEs co-occur with
+            # the anchor under the stated condition.
+            probe = Probe(
+                probe_id     = f"neg_{profile_key}_rule{i}",
+                probe_type   = "negative",
+                question     = (
+                    f"A system runs {display}. The following mitigation is confirmed: "
+                    f"{condition}. "
+                    f"Given that {anchor} was originally a concern, which of the following "
+                    f"CVEs would still be exploitable: {', '.join(absent)}? "
+                    f"State clearly which ones are no longer a risk and why."
+                ),
+                context      = f"Stack: {display}. Mitigation: {condition}. {reason}",
+                ground_truth = still_ok,   # these SHOULD still be mentioned
+                absent_truth = absent,     # these should be called NOT exploitable
+                signal_types = ["negative_stack_profile"],
+                gt_probs     = {},
+                direction    = "",
+            )
+            probes.append(probe)
+
+    random.shuffle(probes)
+    print(f"  Negative probes from stack profiles: {len(probes)} built")
     return probes[:max_probes]
 
 
@@ -685,11 +785,13 @@ def main():
         probes += build_cwe_probes(cooc_data,    max_probes=args.max_probes)
         probes += build_cve_probes(corr_recs,    max_probes=args.max_probes)
         probes += build_directional_probes(cooc_data, max_probes=args.max_probes // 2)
+        probes += build_negative_probes(max_probes=args.max_probes)
 
     print(f"  Total probes: {len(probes)}")
-    for ptype in ("owasp", "cwe", "cve", "directional"):
+    for ptype in ("owasp", "cwe", "cve", "directional", "negative"):
         n = sum(1 for p in probes if p.probe_type == ptype)
-        print(f"    {ptype:<14} {n}")
+        if n:
+            print(f"    {ptype:<14} {n}")
 
     # ── Load model and evaluate ────────────────────────────────────────────
     pipe = load_model_pipeline(args.model)

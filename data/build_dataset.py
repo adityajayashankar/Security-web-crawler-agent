@@ -1138,14 +1138,25 @@ def to_blog_cooccurrence_pairs(record: dict, blog_map: dict) -> list:
         for bp in blog_pairs:
             other = bp.get("cve_b", "") if bp.get("cve_a", "").upper() == cve_id else bp.get("cve_a", "")
             other = other.upper()
+            sig   = bp.get("signal", "co_page")
+            conf  = bp.get("confidence", 0.25)
             if other and other != cve_id and other not in seen_co:
                 seen_co.add(other)
-                unique_co_cves.append((other, bp.get("signal", "co_page")))
+                unique_co_cves.append((other, sig, conf))
 
         if unique_co_cves:
+            # Sort by confidence descending so highest-quality signals appear first
+            unique_co_cves.sort(key=lambda x: x[2], reverse=True)
             co_lines = "\n".join(
-                f"  - {cve} (signal: {sig})"
-                for cve, sig in unique_co_cves[:8]
+                f"  - {cve} (signal: {sig}, confidence: {conf:.2f})"
+                for cve, sig, conf in unique_co_cves[:8]
+            )
+            # Compute average confidence for quality indicator
+            avg_conf = sum(c for _, _, c in unique_co_cves[:8]) / len(unique_co_cves[:8])
+            quality_note = (
+                "High-confidence" if avg_conf >= 0.6 else
+                "Medium-confidence" if avg_conf >= 0.35 else
+                "Low-confidence (co-mention only — may reflect comparison, not co-exploitation)"
             )
             pairs.append({
                 "instruction": (
@@ -1153,12 +1164,14 @@ def to_blog_cooccurrence_pairs(record: dict, blog_map: dict) -> list:
                 ),
                 "input": desc,
                 "output": (
-                    f"Security blog analysis reveals {cve_id} co-occurs with "
-                    f"{len(unique_co_cves)} other CVEs on the same pages:\n\n"
+                    f"{quality_note} blog analysis reveals {cve_id} co-occurs with "
+                    f"{len(unique_co_cves)} other CVEs:\n\n"
                     f"{co_lines}\n\n"
-                    f"Co-occurrence on the same page indicates these vulnerabilities "
-                    f"affect related products, are exploited in the same campaigns, "
-                    f"or form parts of the same attack chain. Source: crawled security blogs."
+                    f"Signal types: co_page (0.25, weak — same page mention), "
+                    f"same_paragraph (0.45, moderate), explicit_chain (0.80, strong — "
+                    f"chain language detected). Higher confidence signals indicate "
+                    f"more likely real-world co-exploitation rather than incidental co-mention. "
+                    f"Source: crawled security blogs."
                 ),
                 "layer": "vulnerability_cooccurrence",
                 "cve_id": cve_id,

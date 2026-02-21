@@ -1,27 +1,30 @@
 """
-crawl_blogs.py  -  LangGraph-based agentic vulnerability intelligence crawler
--------------------------------------------------------------------------------
+crawl_blogs.py  —  Fully agentic vulnerability intelligence crawler
+---------------------------------------------------------------------
 Outputs raw_blogs.json structured for the correlation/co-occurrence pipeline.
 
-The pipeline is modelled as a LangGraph StateGraph where each phase is a node:
+The LLM drives the ENTIRE discovery process — no hardcoded topics or websites:
+  Phase 1: LLM plans search strategy           (1 LLM call → 20-30 queries)
+  Phase 2: Tavily discovers URLs                (parallel searches)
+  Phase 3: Dynamic discovery                    (Vulhub + NVD refs, no LLM)
+  Phase 4: crawl4ai deep crawl                  (concurrent, semaphore-controlled)
+  Phase 5: Link harvesting from crawled pages   (follow CVE-rich URLs in content)
+  Phase 6: LLM gap analysis → Round 2 queries   (1 LLM call)
+  Phase 7: Round 2 discover + crawl
+  Phase 8: Structured extraction + save
 
-  init_clients -> llm_plan -> tavily_discover
-      -> [dynamic_sources | skip_dynamic]
-      -> crawl_round1 -> link_harvest
-      -> [gap_analysis | skip_round2]
-      -> discover_round2 -> crawl_round2
-      -> save_results -> END
+Total LLM calls: 2 (plan + gap analysis). No hardcoded topics or websites.
 
 Every record includes:
-  - cves_mentioned, cve_pairs     -> exploit_cooccurrence index
-  - cwes_mentioned                -> shared_cwe index
-  - exploit_chains                -> CVE pairs mentioned as chained
-  - campaign_signals              -> coordinated campaign phrases
-  - owasp_categories              -> shared_owasp index
-  - cvss_scores_found             -> contextual CVSS mentions
-  - affected_products             -> shared_product index
-  - mitre_techniques              -> ATT&CK technique IDs
-  - source_type                   -> for downstream filtering
+  - cves_mentioned, cve_pairs     → exploit_cooccurrence index
+  - cwes_mentioned                → shared_cwe index
+  - exploit_chains                → CVE pairs mentioned as chained
+  - campaign_signals              → coordinated campaign phrases
+  - owasp_categories              → shared_owasp index
+  - cvss_scores_found             → contextual CVSS mentions
+  - affected_products             → shared_product index
+  - mitre_techniques              → ATT&CK technique IDs
+  - source_type                   → for downstream filtering
 
 Usage:
     python data/crawl_blogs.py
@@ -31,8 +34,6 @@ Usage:
     python data/crawl_blogs.py --concurrency 20
 """
 
-from __future__ import annotations
-
 import argparse
 import asyncio
 import json
@@ -41,12 +42,12 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional, TypedDict
+from typing import Optional
+from urllib.parse import urlparse
 
 import requests
 import yaml
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, CacheMode
-from langgraph.graph import StateGraph, END
 
 # Load .env from project root
 try:
@@ -54,11 +55,11 @@ try:
     _env_path = Path(__file__).parent.parent / ".env"
     if _env_path.exists():
         load_dotenv(dotenv_path=_env_path, override=False)
-        print(f"  Loaded .env from {_env_path}")
+        print(f"✔  Loaded .env from {_env_path}")
     else:
-        print("  No .env found - using shell environment variables")
+        print("ℹ  No .env found — using shell environment variables")
 except ImportError:
-    print("  python-dotenv not installed - using shell environment variables only")
+    print("ℹ  python-dotenv not installed — using shell environment variables only")
 
 DEFAULT_CONFIG = Path(__file__).parent / "sources.yaml"
 
@@ -66,7 +67,7 @@ DEFAULT_CONFIG = Path(__file__).parent / "sources.yaml"
 LLM_MAX_RETRIES = 3
 LLM_RETRY_BASE_DELAY = 10
 
-# Fallback order - if the primary model is rate-limited, try the next
+# Fallback order — if the primary model is rate-limited, try the next
 FREE_MODEL_FALLBACKS = [
     "google/gemma-3n-e2b-it:free",
     "google/gemma-3-27b-it:free",
@@ -76,59 +77,22 @@ FREE_MODEL_FALLBACKS = [
 ]
 
 
-# ==============================================================================
-# LANGGRAPH STATE
-# ==============================================================================
-
-class CrawlState(TypedDict, total=False):
-    """Shared state flowing through every node in the graph."""
-    # -- Config
-    cfg: dict
-    settings: dict
-    out_file: str
-    concurrency: int
-    use_dynamic: bool
-    use_round2: bool
-
-    # -- Clients (set once in init node)
-    llm_client: Any
-    llm_models: list[str]
-    tavily_client: Any
-
-    # -- Phase 1 outputs
-    search_queries: list[str]
-
-    # -- Phase 2 outputs
-    url_map: dict[str, str]
-
-    # -- Phase 4+5 outputs
-    records: list[dict]
-    harvested_links: list[str]
-    crawled_urls: set[str]
-
-    # -- Phase 6 outputs
-    r2_queries: list[str]
-
-    # -- Phase 7 outputs
-    r2_url_map: dict[str, str]
-
-
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # CONFIG
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 def load_config(path: Path) -> dict:
     if not path.exists():
         sys.exit(f"[ERROR] Config not found: {path}")
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
-    print(f"  Config: {path}")
+    print(f"✔  Config: {path}")
     return cfg
 
 
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # OPENROUTER (LLM)  +  TAVILY (search)
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 def init_llm(cfg: dict):
     """Initialize OpenRouter client. Returns (client, model_list)."""
@@ -153,7 +117,7 @@ def init_llm(cfg: dict):
         },
     )
     models = [primary] + [m for m in FREE_MODEL_FALLBACKS if m != primary]
-    print(f"  OpenRouter ready: {primary}  (+ {len(models)-1} fallbacks)")
+    print(f"✔  OpenRouter ready: {primary}  (+ {len(models)-1} fallbacks)")
     return client, models
 
 
@@ -171,7 +135,7 @@ def init_tavily(cfg: dict):
         sys.exit("[ERROR] TAVILY_API_KEY not set in environment")
 
     client = TavilyClient(api_key=api_key)
-    print("  Tavily ready")
+    print("✔  Tavily ready")
     return client
 
 
@@ -194,13 +158,13 @@ def _llm_call_with_fallback(
                 if "429" in str(e):
                     if attempt < LLM_MAX_RETRIES - 1:
                         wait = LLM_RETRY_BASE_DELAY * (2 ** attempt)
-                        print(f"    {model.split('/')[-1]} rate-limited, retry in {wait}s ({attempt+2}/{LLM_MAX_RETRIES})")
+                        print(f"    ⏳ {model.split('/')[-1]} rate-limited, retry in {wait}s ({attempt+2}/{LLM_MAX_RETRIES})")
                         time.sleep(wait)
                     else:
-                        print(f"    {model.split('/')[-1]} exhausted retries, trying next model...")
+                        print(f"    ⚠  {model.split('/')[-1]} exhausted retries, trying next model...")
                         break
                 elif "404" in str(e):
-                    print(f"    {model.split('/')[-1]} not found (404), trying next model...")
+                    print(f"    ⚠  {model.split('/')[-1]} not found (404), trying next model...")
                     break
                 else:
                     raise e
@@ -209,8 +173,11 @@ def _llm_call_with_fallback(
 
 def _parse_json_array(raw: str) -> list:
     """Robustly extract a JSON array from LLM output."""
+    # Strip markdown code fences
     raw = re.sub(r"^```[a-z]*\n?", "", raw)
     raw = re.sub(r"\n?```$", "", raw)
+
+    # Try to find a JSON array in the response
     match = re.search(r"\[.*\]", raw, re.DOTALL)
     if match:
         return json.loads(match.group())
@@ -235,43 +202,27 @@ def tavily_search(client, query: str, max_results: int = 10) -> list[dict]:
             for r in resp.get("results", [])
         ]
     except Exception as e:
-        print(f"    Tavily search failed ({query[:50]!r}): {e}")
+        print(f"    ⚠  Tavily search failed ({query[:50]!r}): {e}")
         return []
 
 
-# ==============================================================================
-# GRAPH NODES
-# ==============================================================================
-
-# -- Node: init_clients --------------------------------------------------------
-
-def node_init_clients(state: CrawlState) -> dict:
-    """Initialise LLM + Tavily clients (run once at graph start)."""
-    cfg = state["cfg"]
-    llm_client, llm_models = init_llm(cfg)
-    tavily_client = init_tavily(cfg)
-    return {
-        "llm_client":    llm_client,
-        "llm_models":    llm_models,
-        "tavily_client": tavily_client,
-    }
-
-
-# -- Node: llm_plan (Phase 1) -------------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 1: LLM PLANS SEARCH STRATEGY  (1 call)
+# ══════════════════════════════════════════════════════════════════════════════
 
 SEARCH_PLAN_PROMPT = """You are an expert cybersecurity OSINT researcher building a vulnerability dataset.
 
-Your goal: generate search queries that find pages with VULNERABILITY CORRELATION and CO-OCCURRENCE signals - pages where multiple CVEs appear together.
+Your goal: generate search queries that find pages with VULNERABILITY CORRELATION and CO-OCCURRENCE signals — pages where multiple CVEs appear together.
 
 Target content types:
-1. EXPLOIT CHAINS - multi-CVE attack sequences (CVE-A -> CVE-B), chained vulns
-2. APT/RANSOMWARE CAMPAIGNS - threat groups using multiple CVEs, CISA/FBI advisories
-3. CWE WEAKNESS FAMILIES - injection (CWE-89, CWE-78), memory corruption (CWE-120, CWE-416), auth bypass (CWE-287), deserialization (CWE-502) with real CVE examples
-4. PRODUCT CVE CLUSTERS - Apache, Microsoft, Linux kernel, Cisco, Fortinet, Kubernetes advisories listing multiple CVEs
-5. VULNERABILITY RESEARCH - Project Zero, PortSwigger, Rapid7, HackerOne deep-dives
-6. RECENT HIGH-IMPACT - 2023-2025 critical vulns, actively exploited, zero-days
-7. EXPLOIT DATABASES - PoC code, exploit analysis with CVE references
-8. CLOUD/CONTAINER - Docker escapes, K8s privilege escalation, AWS/GCP/Azure CVEs
+1. EXPLOIT CHAINS — multi-CVE attack sequences (CVE-A → CVE-B), chained vulns
+2. APT/RANSOMWARE CAMPAIGNS — threat groups using multiple CVEs, CISA/FBI advisories
+3. CWE WEAKNESS FAMILIES — injection (CWE-89, CWE-78), memory corruption (CWE-120, CWE-416), auth bypass (CWE-287), deserialization (CWE-502) with real CVE examples
+4. PRODUCT CVE CLUSTERS — Apache, Microsoft, Linux kernel, Cisco, Fortinet, Kubernetes advisories listing multiple CVEs
+5. VULNERABILITY RESEARCH — Project Zero, PortSwigger, Rapid7, HackerOne deep-dives
+6. RECENT HIGH-IMPACT — 2023-2025 critical vulns, actively exploited, zero-days
+7. EXPLOIT DATABASES — PoC code, exploit analysis with CVE references
+8. CLOUD/CONTAINER — Docker escapes, K8s privilege escalation, AWS/GCP/Azure CVEs
 
 Generate exactly {n_queries} diverse search queries. Rules:
 - Return ONLY a JSON array of strings, nothing else
@@ -281,6 +232,30 @@ Generate exactly {n_queries} diverse search queries. Rules:
 - Prioritise pages likely to contain 2+ CVEs (the core co-occurrence signal)
 
 JSON array:"""
+
+
+def llm_plan_searches(client, models: list[str], n_queries: int = 25) -> list[str]:
+    """Phase 1: LLM generates all search queries in one call."""
+    print("\n🧠  Phase 1: LLM planning search strategy...")
+    prompt = SEARCH_PLAN_PROMPT.format(n_queries=n_queries)
+
+    try:
+        raw = _llm_call_with_fallback(
+            client, models,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=4096, temperature=0.4,
+        )
+        queries = _parse_json_array(raw)
+        result = [q for q in queries if isinstance(q, str) and len(q) > 5][:n_queries]
+        print(f"  ✔  LLM generated {len(result)} search queries")
+        for i, q in enumerate(result):
+            print(f"    {i+1:2d}. {q[:90]}")
+        return result
+
+    except Exception as e:
+        print(f"  ⚠  LLM planning failed: {e}")
+        print("  →  Using fallback query set")
+        return _fallback_queries()
 
 
 def _fallback_queries() -> list[str]:
@@ -314,50 +289,22 @@ def _fallback_queries() -> list[str]:
     ]
 
 
-def node_llm_plan(state: CrawlState) -> dict:
-    """Phase 1: LLM generates all search queries in one call."""
-    print("\n[LangGraph] Phase 1: LLM planning search strategy...")
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 2: TAVILY DISCOVERS URLs  (parallel searches)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    settings  = state["settings"]
-    n_queries = settings.get("n_search_queries", 25)
-    prompt    = SEARCH_PLAN_PROMPT.format(n_queries=n_queries)
-
-    try:
-        raw = _llm_call_with_fallback(
-            state["llm_client"], state["llm_models"],
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=4096, temperature=0.4,
-        )
-        queries = _parse_json_array(raw)
-        result  = [q for q in queries if isinstance(q, str) and len(q) > 5][:n_queries]
-        print(f"  LLM generated {len(result)} search queries")
-        for i, q in enumerate(result):
-            print(f"    {i+1:2d}. {q[:90]}")
-        return {"search_queries": result}
-
-    except Exception as e:
-        print(f"  LLM planning failed: {e}")
-        print("  -> Using fallback query set")
-        return {"search_queries": _fallback_queries()}
-
-
-# -- Node: tavily_discover (Phase 2) ------------------------------------------
-
-def node_tavily_discover(state: CrawlState) -> dict:
+def discover_urls_via_tavily(
+    tavily_client, queries: list[str],
+    max_results_per_query: int = 10,
+) -> dict[str, str]:
     """Phase 2: Run all Tavily queries, collect unique URLs with source_type."""
-    queries     = state["search_queries"]
-    tavily_cli  = state["tavily_client"]
-    settings    = state["settings"]
-    max_per_q   = settings.get("max_results_per_query", 10)
-    max_total   = settings.get("max_total_urls", 600)
-
-    print(f"\n[LangGraph] Phase 2: Tavily discovering URLs ({len(queries)} queries)...")
+    print(f"\n🔎  Phase 2: Tavily discovering URLs ({len(queries)} queries)...")
     url_map: dict[str, str] = {}
     total_results = 0
 
     for i, query in enumerate(queries):
         print(f"  [{i+1}/{len(queries)}] {query[:80]}")
-        results = tavily_search(tavily_cli, query, max_results=max_per_q)
+        results = tavily_search(tavily_client, query, max_results=max_results_per_query)
         total_results += len(results)
 
         for r in results:
@@ -365,18 +312,15 @@ def node_tavily_discover(state: CrawlState) -> dict:
             if url and url not in url_map:
                 url_map[url] = _infer_source_type(url)
 
-        time.sleep(0.3)
+        time.sleep(0.3)  # stay polite with Tavily
 
-    print(f"  {total_results} results -> {len(url_map)} unique URLs")
-
-    if len(url_map) > max_total:
-        print(f"  Capping at {max_total} URLs (had {len(url_map)})")
-        url_map = dict(list(url_map.items())[:max_total])
-
-    return {"url_map": url_map}
+    print(f"  ✔  {total_results} results → {len(url_map)} unique URLs")
+    return url_map
 
 
-# -- Node: dynamic_sources (Phase 3) ------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 3: DYNAMIC SOURCES  (Vulhub + NVD refs — no API keys needed)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def discover_vulhub_readmes(dyn_cfg: dict) -> list[str]:
     api_url  = dyn_cfg["api_url"]
@@ -396,10 +340,10 @@ def discover_vulhub_readmes(dyn_cfg: dict) -> list[str]:
             and re.search(r"CVE-\d{4}-\d+", i["path"])
         ]
         urls = [f"{raw_base}{p}" for p in paths[:limit]]
-        print(f"  {len(urls)} Vulhub CVE READMEs")
+        print(f"  ✔  {len(urls)} Vulhub CVE READMEs")
         return urls
     except Exception as e:
-        print(f"  Vulhub failed: {e}")
+        print(f"  ⚠  Vulhub failed: {e}")
         return []
 
 
@@ -410,7 +354,7 @@ def harvest_nvd_reference_urls(dyn_cfg: dict) -> list[str]:
     allowed   = dyn_cfg.get("allowed_domains", [])
 
     if not nvd_path.exists():
-        print(f"  NVD file not found ({nvd_path}), skipping ref harvest")
+        print(f"  ⚠  NVD file not found ({nvd_path}), skipping ref harvest")
         return []
 
     with open(nvd_path, encoding="utf-8") as f:
@@ -434,23 +378,21 @@ def harvest_nvd_reference_urls(dyn_cfg: dict) -> list[str]:
         if len(urls) >= max_total:
             break
 
-    print(f"  {len(urls)} NVD reference URLs")
+    print(f"  ✔  {len(urls)} NVD reference URLs")
     return urls
 
 
-def node_dynamic_sources(state: CrawlState) -> dict:
-    """Phase 3: Collect URLs from dynamic API sources (Vulhub + NVD refs)."""
-    cfg     = state["cfg"]
-    url_map = dict(state["url_map"])
-    dyn     = cfg.get("dynamic", {})
+def discover_dynamic_sources(cfg: dict) -> dict[str, str]:
+    """Phase 3: Collect URLs from dynamic API sources."""
+    dyn = cfg.get("dynamic", {})
+    url_map: dict[str, str] = {}
 
-    print("\n[LangGraph] Phase 3: Dynamic source discovery...")
+    print("\n📂  Phase 3: Dynamic source discovery...")
 
     vulhub_cfg = dyn.get("vulhub", {})
     if vulhub_cfg.get("enabled", True):
         for url in discover_vulhub_readmes(vulhub_cfg):
-            if url not in url_map:
-                url_map[url] = "vulhub_writeup"
+            url_map[url] = "vulhub_writeup"
 
     nvd_cfg = dyn.get("nvd_references", {})
     if nvd_cfg.get("enabled", True):
@@ -458,18 +400,13 @@ def node_dynamic_sources(state: CrawlState) -> dict:
             if url not in url_map:
                 url_map[url] = _infer_source_type(url)
 
-    added = len(url_map) - len(state["url_map"])
-    print(f"  +{added} dynamic URLs  (total: {len(url_map)})")
-    return {"url_map": url_map}
+    print(f"  ✔  {len(url_map)} dynamic URLs total")
+    return url_map
 
 
-def node_skip_dynamic(state: CrawlState) -> dict:
-    """No-op node when --no-dynamic is set."""
-    print("\n  --no-dynamic: skipping Vulhub + NVD refs")
-    return {}
-
-
-# -- Node: crawl_round1 (Phase 4+5) -------------------------------------------
+# ══════════════════════════════════════════════════════════════════════════════
+# STRUCTURED EXTRACTION  (regex-based, no LLM needed)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def extract_correlation_signals(markdown: str, cfg: dict) -> dict:
     """
@@ -478,9 +415,11 @@ def extract_correlation_signals(markdown: str, cfg: dict) -> dict:
     """
     ext = cfg.get("extraction_targets", {})
 
+    # ── CVEs ──────────────────────────────────────────────────────────────
     cves = list(set(re.findall(r"CVE-\d{4}-\d+", markdown, re.I)))
     cves = [c.upper() for c in cves]
 
+    # ── All CVE pairs on same page = implicit co-occurrence ───────────────
     cve_pairs: list[dict] = []
     if len(cves) >= 2:
         seen_pairs: set = set()
@@ -489,19 +428,22 @@ def extract_correlation_signals(markdown: str, cfg: dict) -> dict:
                 pair = tuple(sorted([ca, cb]))
                 if pair not in seen_pairs:
                     seen_pairs.add(pair)
-                    cve_pairs.append({
-                        "cve_a": pair[0], "cve_b": pair[1],
-                        "signal": "co_page",
-                        "confidence": 0.25,  # Low: co-mention on same page (may be comparison, not co-exploitation)
-                    })
+                    cve_pairs.append({"cve_a": pair[0], "cve_b": pair[1], "signal": "co_page"})
 
+    # ── CWEs ──────────────────────────────────────────────────────────────
     cwes = list(set(re.findall(r"CWE-\d+", markdown, re.I)))
     cwes = [c.upper() for c in cwes]
 
+    # ── OWASP categories ──────────────────────────────────────────────────
     owasp = list(set(re.findall(r"A\d{2}:20\d\d", markdown)))
+
+    # ── CVSS scores ───────────────────────────────────────────────────────
     cvss_hits = re.findall(r"CVSS[v23\s:]+[\d.]+", markdown, re.I)
+
+    # ── MITRE ATT&CK technique IDs ────────────────────────────────────────
     mitre_techs = list(set(re.findall(r"T\d{4}(?:\.\d{3})?", markdown)))
 
+    # ── Affected products ─────────────────────────────────────────────────
     product_patterns = [
         r"(?:affects?|vulnerable|patched in|fixed in)\s+([\w\s\-\.]{3,40}?)\s+(?:v?[\d]+\.[\d]+|version)",
         r"([\w\-\.]{3,30})\s+(?:v?[\d]+\.[\d]+\.[\d]+)",
@@ -511,6 +453,7 @@ def extract_correlation_signals(markdown: str, cfg: dict) -> dict:
         products.extend(re.findall(pat, markdown, re.I))
     products = list(set(p.strip().lower() for p in products if 2 < len(p.strip()) < 40))[:30]
 
+    # ── Exploit chains — CVE pairs with explicit chaining context ─────────
     chain_phrases = ext.get("exploit_chain_phrases", [
         "chain", "chained", "combined", "initial access", "privilege escalation",
         "lateral movement", "followed by", "then", "leads to", "allows",
@@ -531,10 +474,10 @@ def extract_correlation_signals(markdown: str, cfg: dict) -> dict:
                         "cve_a":   pair[0],
                         "cve_b":   pair[1],
                         "signal":  "explicit_chain",
-                        "confidence": 0.80,  # High: explicit chain language + CVE co-mention in same sentence
                         "context": sent.strip()[:300],
                     })
 
+    # Same-paragraph co-occurrence as weaker chain signal
     paragraphs = markdown.split("\n\n")
     for para in paragraphs:
         found = list(set(re.findall(r"CVE-\d{4}-\d+", para, re.I)))
@@ -548,10 +491,10 @@ def extract_correlation_signals(markdown: str, cfg: dict) -> dict:
                             "cve_a":  pair[0],
                             "cve_b":  pair[1],
                             "signal": "same_paragraph",
-                            "confidence": 0.45,  # Medium: same paragraph but no explicit chain language
                             "context": para.strip()[:200],
                         })
 
+    # ── Campaign signals — CVEs + threat actor context ────────────────────
     campaign_phrases = ext.get("campaign_phrases", [
         "ransomware", "threat actor", "APT", "nation-state", "attributed",
         "exploited in the wild", "actively exploited", "campaign", "group",
@@ -563,6 +506,7 @@ def extract_correlation_signals(markdown: str, cfg: dict) -> dict:
             if any(p.lower() in sent.lower() for p in campaign_phrases):
                 campaign_hits.append(sent.strip()[:300])
 
+    # ── Severity context ──────────────────────────────────────────────────
     severity_mentions = re.findall(
         r"(?:critical|high|medium|low)\s+(?:severity|risk|vulnerability|CVE)",
         markdown, re.I,
@@ -582,95 +526,16 @@ def extract_correlation_signals(markdown: str, cfg: dict) -> dict:
     }
 
 
-# ── LLM-based exploit chain extraction ────────────────────────────────────────
-# For pages with 3+ CVEs, regex alone misses implicit chains like:
-#   "The attacker first exploited the SSRF. After gaining internal access,
-#    they leveraged the deserialization flaw."
-# We send these pages to the LLM to extract directed chain relationships.
-
-_LLM_CHAIN_EXTRACT_PROMPT = """You are a vulnerability analyst. The following security article mentions these CVEs: {cves}
-
-Extract ALL exploit chains / attack sequences from the text. A chain means one vulnerability enables or leads to exploiting another.
-
-Return ONLY a JSON array of objects, each with:
-  {{"from": "CVE-XXXX-XXXXX", "to": "CVE-YYYY-YYYYY", "relationship": "brief description of how 'from' enables 'to'"}}
-
-If no chains exist, return an empty array: []
-
-Rules:
-- "from" is the first vulnerability exploited; "to" is what it enables
-- Include implicit chains (e.g., SSRF enabling access to an internal service with a separate CVE)
-- Only use CVE IDs that appear in the text
-- Maximum 10 chain entries
-
-Text:
-{text}
-
-JSON array:"""
-
-
-def _llm_extract_chains(
-    markdown: str,
-    cves: list[str],
-    llm_client,
-    llm_models: list[str],
-) -> list[dict]:
-    """
-    Use the LLM to extract directed exploit chains from a page with 3+ CVEs.
-    Returns list of {cve_a, cve_b, signal, context} dicts matching the
-    exploit_chains schema used by extract_correlation_signals().
-    """
-    if not llm_client or not llm_models or len(cves) < 3:
-        return []
-
-    # Truncate content to fit context window — keep first 4000 chars
-    text_snippet = markdown[:4000]
-    prompt = _LLM_CHAIN_EXTRACT_PROMPT.format(
-        cves=", ".join(cves[:20]),
-        text=text_snippet,
-    )
-
-    try:
-        raw = _llm_call_with_fallback(
-            llm_client, llm_models,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=1024, temperature=0.1,
-        )
-        results = _parse_json_array(raw)
-    except Exception:
-        return []
-
-    chains = []
-    valid_cves = {c.upper() for c in cves}
-    seen = set()
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        cve_from = str(item.get("from", "")).upper()
-        cve_to   = str(item.get("to", "")).upper()
-        rel      = str(item.get("relationship", ""))[:300]
-        if cve_from not in valid_cves or cve_to not in valid_cves:
-            continue
-        if cve_from == cve_to:
-            continue
-        pair_key = (cve_from, cve_to)
-        if pair_key in seen:
-            continue
-        seen.add(pair_key)
-        chains.append({
-            "cve_a":   cve_from,
-            "cve_b":   cve_to,
-            "signal":  "llm_directed_chain",
-            "confidence": 0.85,  # High: LLM-extracted directed relationship
-            "context": rel,
-        })
-
-    return chains[:10]
-
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 4 + 5: CONCURRENT CRAWL  +  LINK HARVESTING
+# ══════════════════════════════════════════════════════════════════════════════
 
 def harvest_links_from_markdown(markdown: str) -> list[str]:
-    """Extract URLs from crawled page content that look CVE-rich."""
-    url_pattern = r'https?://[^\s\)\]\>"' + r"'" + r'`]+'
+    """
+    Phase 5: Extract URLs from crawled page content that look like they
+    lead to more CVE-rich pages. The agent "follows" promising links.
+    """
+    url_pattern = r'https?://[^\s\)\]\>"\'`]+'
     found_urls = re.findall(url_pattern, markdown)
 
     security_domains = [
@@ -706,27 +571,10 @@ def is_quality_content(text: str, keywords: list[str], min_chars: int) -> bool:
     return any(kw in lower for kw in keywords)
 
 
-def make_record(url: str, markdown: str, source_type: str, cfg: dict,
-                 llm_client=None, llm_models: list[str] | None = None) -> dict:
+def make_record(url: str, markdown: str, source_type: str, cfg: dict) -> dict:
     settings  = cfg.get("settings", {})
     max_chars = settings.get("max_content_chars", 10000)
     signals   = extract_correlation_signals(markdown, cfg)
-
-    # LLM extraction pass: pages with 3+ CVEs get directed chain analysis
-    if len(signals.get("cves_mentioned", [])) >= 3 and llm_client and llm_models:
-        llm_chains = _llm_extract_chains(
-            markdown, signals["cves_mentioned"], llm_client, llm_models,
-        )
-        if llm_chains:
-            # Merge with existing chains, dedup by (cve_a, cve_b)
-            existing_pairs = {
-                (c["cve_a"], c["cve_b"]) for c in signals.get("exploit_chains", [])
-            }
-            for lc in llm_chains:
-                if (lc["cve_a"], lc["cve_b"]) not in existing_pairs:
-                    signals["exploit_chains"].append(lc)
-                    existing_pairs.add((lc["cve_a"], lc["cve_b"]))
-
     return {
         "url":         url,
         "source_type": source_type,
@@ -738,7 +586,6 @@ def make_record(url: str, markdown: str, source_type: str, cfg: dict,
 async def crawl_url(
     crawler: AsyncWebCrawler, url: str, source_type: str,
     semaphore: asyncio.Semaphore, cfg: dict, idx: int, total: int,
-    llm_client=None, llm_models: list[str] | None = None,
 ) -> tuple[Optional[dict], list[str]]:
     """Crawl a single URL. Returns (record_or_None, harvested_links)."""
     settings  = cfg.get("settings", {})
@@ -754,42 +601,39 @@ async def crawl_url(
                 harvested = harvest_links_from_markdown(result.markdown)
 
                 if is_quality_content(result.markdown, keywords, min_chars):
-                    record   = make_record(url, result.markdown, source_type, cfg,
-                                           llm_client=llm_client, llm_models=llm_models)
+                    record   = make_record(url, result.markdown, source_type, cfg)
                     n_cves   = len(record["cves_mentioned"])
                     n_chains = len(record["exploit_chains"])
                     tags = []
                     if n_cves:   tags.append(f"{n_cves} CVEs")
                     if n_chains: tags.append(f"{n_chains} chains")
                     tag_str = f" [{', '.join(tags)}]" if tags else ""
-                    print(f"  [{idx}/{total}] {source_type:<25} {url[:55]}{tag_str}")
+                    print(f"  ✅ [{idx}/{total}] {source_type:<25} {url[:55]}{tag_str}")
                     return record, harvested
                 else:
-                    print(f"  [{idx}/{total}] Low quality: {url[:60]}")
+                    print(f"  ⚠  [{idx}/{total}] Low quality: {url[:60]}")
                     return None, harvested
             else:
-                print(f"  [{idx}/{total}] Failed: {url[:60]}")
+                print(f"  ❌ [{idx}/{total}] Failed: {url[:60]}")
         except Exception as e:
-            print(f"  [{idx}/{total}] Error ({url[:45]}): {e}")
+            print(f"  ❌ [{idx}/{total}] Error ({url[:45]}): {e}")
 
     return None, []
 
 
 async def crawl_all_concurrent(
     url_map: dict[str, str], cfg: dict, concurrency: int,
-    llm_client=None, llm_models: list[str] | None = None,
 ) -> tuple[list[dict], list[str]]:
     """Crawl all URLs concurrently. Returns (records, all_harvested_links)."""
     urls      = list(url_map.keys())
     total     = len(urls)
     semaphore = asyncio.Semaphore(concurrency)
 
-    print(f"\n  Crawling {total} URLs  [{concurrency} concurrent workers]\n")
+    print(f"\n🌐  Crawling {total} URLs  [{concurrency} concurrent workers]\n")
 
     async with AsyncWebCrawler(verbose=False) as crawler:
         tasks = [
-            crawl_url(crawler, url, url_map[url], semaphore, cfg, i+1, total,
-                      llm_client=llm_client, llm_models=llm_models)
+            crawl_url(crawler, url, url_map[url], semaphore, cfg, i+1, total)
             for i, url in enumerate(urls)
         ]
         raw_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -804,6 +648,7 @@ async def crawl_all_concurrent(
                 records.append(record)
             all_harvested.extend(harvested)
 
+    # ── Summary ──────────────────────────────────────────────────────────────
     failed       = total - len(records)
     total_cves   = sum(len(r.get("cves_mentioned", [])) for r in records)
     total_pairs  = sum(len(r.get("cve_pairs", [])) for r in records)
@@ -811,82 +656,24 @@ async def crawl_all_concurrent(
     total_camp   = sum(len(r.get("campaign_signals", [])) for r in records)
     total_cwes   = sum(len(r.get("cwes_mentioned", [])) for r in records)
 
-    print(f"\n  {len(records)} pages kept  |  {failed} failed/filtered")
-    print(f"  CVE mentions: {total_cves}  |  CVE pairs: {total_pairs}")
-    print(f"  Exploit chains: {total_chains}  |  Campaign signals: {total_camp}  |  CWE mentions: {total_cwes}")
-    print(f"  {len(all_harvested)} links harvested from crawled pages")
+    print(f"\n  ✔  {len(records)} pages kept  |  {failed} failed/filtered")
+    print(f"  📊 CVE mentions: {total_cves}  |  CVE pairs: {total_pairs}")
+    print(f"  📊 Exploit chains: {total_chains}  |  Campaign signals: {total_camp}  |  CWE mentions: {total_cwes}")
+    print(f"  🔗 {len(all_harvested)} links harvested from crawled pages")
 
     return records, all_harvested
 
 
-def node_crawl_round1(state: CrawlState) -> dict:
-    """Phase 4+5: Crawl Round 1 URLs + harvest links from content."""
-    url_map     = state["url_map"]
-    cfg         = state["cfg"]
-    concurrency = state["concurrency"]
+# ══════════════════════════════════════════════════════════════════════════════
+# PHASE 6: LLM GAP ANALYSIS  (1 call)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    print(f"\n[LangGraph] Phase 4+5: Crawling Round 1 ({len(url_map)} URLs)...")
-
-    records, harvested_links = asyncio.run(
-        crawl_all_concurrent(url_map, cfg, concurrency,
-                             llm_client=state.get("llm_client"),
-                             llm_models=state.get("llm_models"))
-    )
-
-    return {
-        "records":         records,
-        "harvested_links": harvested_links,
-        "crawled_urls":    set(url_map.keys()),
-    }
-
-
-# -- Node: link_harvest (Phase 5b) --------------------------------------------
-
-def node_link_harvest(state: CrawlState) -> dict:
-    """Phase 5b: Crawl harvested links (new URLs found inside Round 1 pages)."""
-    harvested    = state.get("harvested_links", [])
-    crawled_urls = set(state.get("crawled_urls", set()))
-    cfg          = state["cfg"]
-    settings     = state["settings"]
-    concurrency  = state["concurrency"]
-    records      = list(state.get("records", []))
-    max_harvest  = settings.get("max_harvested_urls", 100)
-
-    new_links = [u for u in set(harvested) if u not in crawled_urls]
-    if not new_links:
-        return {"records": records, "crawled_urls": crawled_urls}
-
-    new_links   = new_links[:max_harvest]
-    harvest_map = {u: _infer_source_type(u) for u in new_links}
-    print(f"\n[LangGraph] Phase 5b: Crawling {len(harvest_map)} harvested links...")
-
-    harvest_records, _ = asyncio.run(
-        crawl_all_concurrent(harvest_map, cfg, concurrency,
-                             llm_client=state.get("llm_client"),
-                             llm_models=state.get("llm_models"))
-    )
-    records.extend(harvest_records)
-    crawled_urls.update(harvest_map.keys())
-
-    return {
-        "records":      records,
-        "crawled_urls": crawled_urls,
-    }
-
-
-# -- Node: gap_analysis (Phase 6) ---------------------------------------------
-
-def node_gap_analysis(state: CrawlState) -> dict:
+def llm_gap_analysis(
+    client, models: list[str],
+    records: list[dict], n_queries: int = 10,
+) -> list[str]:
     """Phase 6: LLM reviews Round 1 results and generates follow-up queries."""
-    print("\n[LangGraph] Phase 6: LLM gap analysis...")
-
-    records   = state.get("records", [])
-    settings  = state["settings"]
-    n_queries = settings.get("n_round2_queries", 10)
-
-    if not records:
-        print("  No records from Round 1 - skipping gap analysis")
-        return {"r2_queries": []}
+    print("\n🧠  Phase 6: LLM gap analysis...")
 
     total_cves   = sum(len(r.get("cves_mentioned", [])) for r in records)
     total_pairs  = sum(len(r.get("cve_pairs", [])) for r in records)
@@ -926,102 +713,25 @@ Return ONLY a JSON array of {n_queries} query strings:"""
 
     try:
         raw = _llm_call_with_fallback(
-            state["llm_client"], state["llm_models"],
+            client, models,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=2048, temperature=0.3,
         )
         queries = _parse_json_array(raw)
-        result  = [q for q in queries if isinstance(q, str) and len(q) > 5][:n_queries]
-        print(f"  LLM generated {len(result)} follow-up queries")
+        result = [q for q in queries if isinstance(q, str) and len(q) > 5][:n_queries]
+        print(f"  ✔  LLM generated {len(result)} follow-up queries")
         for i, q in enumerate(result):
             print(f"    {i+1:2d}. {q[:90]}")
-        return {"r2_queries": result}
+        return result
 
     except Exception as e:
-        print(f"  Gap analysis failed: {e}")
-        return {"r2_queries": []}
+        print(f"  ⚠  Gap analysis failed: {e}")
+        return []
 
 
-def node_skip_round2(state: CrawlState) -> dict:
-    """No-op node when --no-round2 is set."""
-    print("\n  --no-round2: skipping gap analysis")
-    return {"r2_queries": []}
-
-
-# -- Node: discover_round2 (Phase 7a) -----------------------------------------
-
-def node_discover_round2(state: CrawlState) -> dict:
-    """Phase 7a: Tavily search for Round 2 gap-fill queries."""
-    r2_queries   = state.get("r2_queries", [])
-    crawled_urls = set(state.get("crawled_urls", set()))
-    settings     = state["settings"]
-    max_r2       = settings.get("max_round2_urls", 150)
-
-    if not r2_queries:
-        return {"r2_url_map": {}}
-
-    print(f"\n[LangGraph] Phase 7a: Round 2 discovery ({len(r2_queries)} queries)...")
-    r2_url_map = {}
-    for i, query in enumerate(r2_queries):
-        print(f"  [{i+1}/{len(r2_queries)}] {query[:80]}")
-        results = tavily_search(
-            state["tavily_client"], query,
-            max_results=settings.get("max_results_per_query", 10),
-        )
-        for r in results:
-            url = r.get("url", "")
-            if url and url not in crawled_urls and url not in r2_url_map:
-                r2_url_map[url] = _infer_source_type(url)
-        time.sleep(0.3)
-
-    if len(r2_url_map) > max_r2:
-        r2_url_map = dict(list(r2_url_map.items())[:max_r2])
-
-    print(f"  {len(r2_url_map)} new URLs for Round 2")
-    return {"r2_url_map": r2_url_map}
-
-
-# -- Node: crawl_round2 (Phase 7b) --------------------------------------------
-
-def node_crawl_round2(state: CrawlState) -> dict:
-    """Phase 7b: Crawl Round 2 URLs."""
-    r2_url_map  = state.get("r2_url_map", {})
-    records     = list(state.get("records", []))
-    cfg         = state["cfg"]
-    concurrency = state["concurrency"]
-
-    if not r2_url_map:
-        return {"records": records}
-
-    print(f"\n[LangGraph] Phase 7b: Crawling {len(r2_url_map)} Round 2 URLs...")
-    r2_records, _ = asyncio.run(
-        crawl_all_concurrent(r2_url_map, cfg, concurrency,
-                             llm_client=state.get("llm_client"),
-                             llm_models=state.get("llm_models"))
-    )
-    records.extend(r2_records)
-    print(f"  Round 2 added {len(r2_records)} records")
-    return {"records": records}
-
-
-# -- Node: save_results (Phase 8) ---------------------------------------------
-
-def node_save_results(state: CrawlState) -> dict:
-    """Phase 8: Save all records + print final report."""
-    records  = state.get("records", [])
-    out_file = state["out_file"]
-
-    Path(out_file).parent.mkdir(parents=True, exist_ok=True)
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2, ensure_ascii=False)
-
-    _print_report(records, out_file)
-    return {}
-
-
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # UTILITIES
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _infer_source_type(url: str) -> str:
     """Heuristic source_type from URL domain."""
@@ -1045,7 +755,7 @@ def _infer_source_type(url: str) -> str:
     return "research_blog"
 
 
-def _print_report(data: list[dict], out_file: str):
+def print_report(data: list[dict], out_file: str):
     """Final summary report."""
     source_counts: dict[str, int] = {}
     for d in data:
@@ -1061,7 +771,7 @@ def _print_report(data: list[dict], out_file: str):
     cwe_pages    = sum(1 for d in data if d.get("cwes_mentioned"))
 
     print(f"\n{'='*65}")
-    print(f"  Saved {len(data)} records -> {out_file}")
+    print(f"✅  Saved {len(data)} records → {out_file}")
     print(f"{'='*65}")
     print(f"\n   Co-occurrence signal summary:")
     print(f"     Pages with CVE mentions:      {cve_pages}")
@@ -1074,94 +784,9 @@ def _print_report(data: list[dict], out_file: str):
         print(f"     {src:<30} {cnt}")
 
 
-# ==============================================================================
-# LANGGRAPH: BUILD THE STATE GRAPH
-# ==============================================================================
-
-def _route_dynamic(state: CrawlState) -> str:
-    """Conditional edge: include dynamic sources or skip."""
-    if state.get("use_dynamic", True):
-        return "dynamic_sources"
-    return "skip_dynamic"
-
-
-def _route_round2(state: CrawlState) -> str:
-    """Conditional edge: run gap analysis or skip."""
-    if state.get("use_round2", True) and state.get("records"):
-        return "gap_analysis"
-    return "skip_round2"
-
-
-def build_graph() -> StateGraph:
-    """
-    Construct the LangGraph StateGraph for the blog crawler.
-
-    Graph topology:
-        init_clients -> llm_plan -> tavily_discover
-            -> [dynamic_sources | skip_dynamic]
-            -> crawl_round1 -> link_harvest
-            -> [gap_analysis | skip_round2]
-            -> discover_round2 -> crawl_round2
-            -> save_results -> END
-    """
-    graph = StateGraph(CrawlState)
-
-    # -- Add nodes
-    graph.add_node("init_clients",    node_init_clients)
-    graph.add_node("llm_plan",        node_llm_plan)
-    graph.add_node("tavily_discover", node_tavily_discover)
-    graph.add_node("dynamic_sources", node_dynamic_sources)
-    graph.add_node("skip_dynamic",    node_skip_dynamic)
-    graph.add_node("crawl_round1",    node_crawl_round1)
-    graph.add_node("link_harvest",    node_link_harvest)
-    graph.add_node("gap_analysis",    node_gap_analysis)
-    graph.add_node("skip_round2",     node_skip_round2)
-    graph.add_node("discover_round2", node_discover_round2)
-    graph.add_node("crawl_round2",    node_crawl_round2)
-    graph.add_node("save_results",    node_save_results)
-
-    # -- Wire edges
-    graph.set_entry_point("init_clients")
-
-    graph.add_edge("init_clients",    "llm_plan")
-    graph.add_edge("llm_plan",        "tavily_discover")
-
-    # Conditional: dynamic sources or skip
-    graph.add_conditional_edges(
-        "tavily_discover",
-        _route_dynamic,
-        {
-            "dynamic_sources": "dynamic_sources",
-            "skip_dynamic":    "skip_dynamic",
-        },
-    )
-    graph.add_edge("dynamic_sources", "crawl_round1")
-    graph.add_edge("skip_dynamic",    "crawl_round1")
-
-    graph.add_edge("crawl_round1",    "link_harvest")
-
-    # Conditional: gap analysis or skip
-    graph.add_conditional_edges(
-        "link_harvest",
-        _route_round2,
-        {
-            "gap_analysis": "gap_analysis",
-            "skip_round2":  "skip_round2",
-        },
-    )
-    graph.add_edge("gap_analysis",    "discover_round2")
-    graph.add_edge("skip_round2",     "discover_round2")
-
-    graph.add_edge("discover_round2", "crawl_round2")
-    graph.add_edge("crawl_round2",    "save_results")
-    graph.add_edge("save_results",    END)
-
-    return graph
-
-
-# ==============================================================================
-# ORCHESTRATOR  (backward-compatible run() signature for run_pipeline.py)
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
+# ORCHESTRATOR
+# ══════════════════════════════════════════════════════════════════════════════
 
 def run(
     config_path: Path,
@@ -1170,44 +795,107 @@ def run(
     use_round2:  bool = True,
     concurrency: int | None = None,
 ):
-    """
-    Entry point - identical signature to the original crawl_blogs.run().
-    Compiles and invokes the LangGraph state graph.
-    """
     cfg      = load_config(config_path)
     settings = cfg.get("settings", {})
     out_file = out_override or settings.get("output_file", "data/raw_blogs.json")
     workers  = concurrency or settings.get("concurrent_tasks", 15)
+    max_total = settings.get("max_total_urls", 600)
+    n_queries = settings.get("n_search_queries", 25)
 
-    print(f"\n{'='*65}")
-    print(f"  LangGraph Agentic Blog Crawler")
-    print(f"{'='*65}")
+    # ── Phase 1: LLM plans search strategy (1 LLM call) ─────────────────
+    llm_client, llm_models = init_llm(cfg)
+    tavily_client = init_tavily(cfg)
+    queries = llm_plan_searches(llm_client, llm_models, n_queries=n_queries)
 
-    initial_state: CrawlState = {
-        "cfg":          cfg,
-        "settings":     settings,
-        "out_file":     out_file,
-        "concurrency":  workers,
-        "use_dynamic":  use_dynamic,
-        "use_round2":   use_round2,
-    }
+    # ── Phase 2: Tavily discovers URLs ───────────────────────────────────
+    url_map = discover_urls_via_tavily(
+        tavily_client, queries,
+        max_results_per_query=settings.get("max_results_per_query", 10),
+    )
 
-    graph = build_graph()
-    app   = graph.compile()
-    _final = app.invoke(initial_state)
+    # ── Phase 3: Dynamic sources (Vulhub + NVD refs) ─────────────────────
+    if use_dynamic:
+        dynamic_urls = discover_dynamic_sources(cfg)
+        for url, src_type in dynamic_urls.items():
+            if url not in url_map:
+                url_map[url] = src_type
+    else:
+        print("\n  --no-dynamic: skipping Vulhub + NVD refs")
 
-    print(f"\n{'='*65}")
-    print(f"  LangGraph pipeline complete")
-    print(f"{'='*65}\n")
+    # Cap Round 1
+    if len(url_map) > max_total:
+        print(f"  Capping at {max_total} URLs (had {len(url_map)})")
+        url_map = dict(list(url_map.items())[:max_total])
+
+    print(f"\n  Total unique URLs for Round 1: {len(url_map)}")
+
+    # ── Phase 4+5: Crawl + link harvest ──────────────────────────────────
+    records, harvested_links = asyncio.run(
+        crawl_all_concurrent(url_map, cfg, workers)
+    )
+
+    # ── Phase 5b: Crawl harvested links (new URLs from content) ──────────
+    already_crawled = set(url_map.keys())
+    new_links = [u for u in set(harvested_links) if u not in already_crawled]
+    max_harvest = settings.get("max_harvested_urls", 100)
+    harvest_map: dict[str, str] = {}
+
+    if new_links:
+        new_links = new_links[:max_harvest]
+        harvest_map = {u: _infer_source_type(u) for u in new_links}
+        print(f"\n🔗  Phase 5b: Crawling {len(harvest_map)} harvested links...")
+
+        harvest_records, _ = asyncio.run(
+            crawl_all_concurrent(harvest_map, cfg, workers)
+        )
+        records.extend(harvest_records)
+
+    # ── Phase 6+7: LLM gap analysis → Round 2 ───────────────────────────
+    if use_round2 and records:
+        r2_queries = llm_gap_analysis(
+            llm_client, llm_models, records,
+            n_queries=settings.get("n_round2_queries", 10),
+        )
+
+        if r2_queries:
+            print(f"\n🔄  Round 2: Discovering + crawling for gap-fill...")
+            r2_url_map = discover_urls_via_tavily(
+                tavily_client, r2_queries,
+                max_results_per_query=settings.get("max_results_per_query", 10),
+            )
+
+            # Remove already-crawled URLs
+            all_crawled = already_crawled | set(harvest_map.keys())
+            r2_url_map = {u: st for u, st in r2_url_map.items() if u not in all_crawled}
+
+            if r2_url_map:
+                max_r2 = settings.get("max_round2_urls", 150)
+                if len(r2_url_map) > max_r2:
+                    r2_url_map = dict(list(r2_url_map.items())[:max_r2])
+
+                r2_records, _ = asyncio.run(
+                    crawl_all_concurrent(r2_url_map, cfg, workers)
+                )
+                records.extend(r2_records)
+                print(f"  ✔  Round 2 added {len(r2_records)} records")
+    elif not use_round2:
+        print("\n  --no-round2: skipping gap analysis")
+
+    # ── Phase 8: Save + report ───────────────────────────────────────────
+    Path(out_file).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_file, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2, ensure_ascii=False)
+
+    print_report(records, out_file)
 
 
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 # CLI
-# ==============================================================================
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="LangGraph-based agentic vulnerability intelligence crawler"
+        description="Fully agentic vulnerability intelligence crawler"
     )
     parser.add_argument("--config",      default=str(DEFAULT_CONFIG))
     parser.add_argument("--out",         default=None, help="Override output path")

@@ -187,3 +187,78 @@ def nvd_record_count(nvd_path: Path | str = "data/raw_nvd.json") -> int:
             return len(json.load(f))
     except Exception:
         return 0
+
+
+# ── Generic helpers for other crawlers ─────────────────────────────────────────
+
+def record_count(path: Path | str) -> int:
+    """Return number of records in a JSON file (list), or 0 if missing/invalid."""
+    p = Path(path)
+    if not p.exists():
+        return 0
+    try:
+        with open(p, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return len(data)
+        if isinstance(data, dict):
+            # MITRE ATT&CK stores {techniques: [...], capec_patterns: [...], ...}
+            return sum(
+                len(v) for v in data.values()
+                if isinstance(v, list) and v and isinstance(v[0], dict)
+            )
+        return 0
+    except Exception:
+        return 0
+
+
+def latest_date_field(
+    path:           Path | str,
+    field_name:     str        = "date_published",
+    lookback_days:  int        = 7,
+) -> str | None:
+    """
+    Scan a JSON list file, find the most recent value of ``field_name``,
+    subtract ``lookback_days`` safety buffer, and return an ISO 8601 date.
+
+    Works for any flat JSON-line list where records carry a date string
+    field (e.g. Exploit-DB ``date_published``, CISA KEV ``dateAdded``).
+
+    Returns None if the file is missing or has no parseable dates.
+    """
+    p = Path(path)
+    if not p.exists():
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            records = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(records, list):
+        return None
+
+    dates: list[str] = [
+        r.get(field_name, "")
+        for r in records
+        if isinstance(r, dict) and r.get(field_name, "")
+    ]
+    if not dates:
+        return None
+
+    latest = sorted(dates)[-1]
+    try:
+        dt = datetime.fromisoformat(latest.replace("Z", "+00:00"))
+    except ValueError:
+        # Try parsing common date formats
+        for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M:%S", "%m/%d/%Y"):
+            try:
+                dt = datetime.strptime(latest, fmt).replace(tzinfo=timezone.utc)
+                break
+            except ValueError:
+                continue
+        else:
+            return None
+
+    from datetime import timedelta
+    start_dt = dt - timedelta(days=lookback_days)
+    return start_dt.strftime("%Y-%m-%d")

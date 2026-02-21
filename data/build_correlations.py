@@ -21,11 +21,60 @@ Output:
 """
 
 import json
+import math
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
+
+# ── TF-IDF-style signal weighting ─────────────────────────────────────────────
+# Signals from very large groups (e.g., shared_product:"linux:linux_kernel"
+# connecting 5000 CVEs) are noise, not signal.  We penalise them with an
+# inverse-group-frequency weight: weight = log(N / group_size) / log(N),
+# clamped to [0.1, 1.0].  Groups with >N members effectively get ~0.1.
+
+IDF_LARGE_GROUP_THRESHOLD = 100  # groups above this start getting penalised
+
+
+def compute_idf_weights(
+    total_cves: int,
+    cwe_index:     dict[str, set[str]],
+    product_index: dict[str, set[str]],
+    owasp_index:   dict[str, set[str]],
+    attack_index:  dict[str, set[str]],
+    capec_index:   dict[str, set[str]],
+) -> dict[str, float]:
+    """
+    Pre-compute IDF weight for every group key across all indices.
+    Returns a dict  {"shared_cwe:CWE-79": 0.45, "shared_product:linux:linux_kernel": 0.12, ...}
+    """
+    N = max(total_cves, 1)
+    log_N = math.log(N) if N > 1 else 1.0
+    weights: dict[str, float] = {}
+
+    def _idf(group_size: int) -> float:
+        if group_size <= 1:
+            return 1.0
+        raw = math.log(N / group_size) / log_N
+        return max(0.1, min(1.0, raw))
+
+    for key, members in cwe_index.items():
+        weights[f"shared_cwe:{key}"] = _idf(len(members))
+    for key, members in product_index.items():
+        weights[f"shared_product:{key}"] = _idf(len(members))
+    for key, members in owasp_index.items():
+        weights[f"shared_owasp:{key}"] = _idf(len(members))
+    for key, members in attack_index.items():
+        weights[f"shared_attack_technique:{key}"] = _idf(len(members))
+    for key, members in capec_index.items():
+        weights[f"shared_capec:{key}"] = _idf(len(members))
+
+    # Fixed-weight signals (always high quality)
+    weights["kev_campaign_temporal"] = 1.0
+    weights["exploit_chain_cooccurrence"] = 1.0
+
+    return weights
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -199,6 +248,7 @@ def build_correlation_record(
     exploit_cooccur: dict[str, set[str]],
     owasp_index:     dict[str, set[str]],
     mitre_data:      dict,
+    idf_weights:     dict[str, float] | None = None,
     max_related:     int = 10,
 ) -> dict:
     """
@@ -258,17 +308,48 @@ def build_correlation_record(
                 if rel_cve != cve_id:
                     related[rel_cve].append(f"shared_owasp:{owasp_cat[:30]}")
 
-    # Score and rank: more signals = stronger correlation
+    # ── Temporal decay multiplier ──────────────────────────────────────
+    # Recent CVE pairs get full weight; older pairs decay.
+    # Extract year from cve_id (e.g., CVE-2021-44228 → 2021)
+    def _recency_multiplier(cve_a: str, cve_b: str) -> float:
+        """Return decay factor based on the *older* CVE's year."""
+        try:
+            year_a = int(cve_a.split("-")[1])
+            year_b = int(cve_b.split("-")[1])
+        except (IndexError, ValueError):
+            return 1.0
+        older_year = min(year_a, year_b)
+        current_year = datetime.now().year
+        age = current_year - older_year
+        if age <= 1:
+            return 1.0
+        elif age <= 3:
+            return 0.85
+        elif age <= 5:
+            return 0.65
+        else:
+            return 0.5
+
+    # Score and rank: IDF-weighted signals × temporal decay
+    def _score_signals(rel_cve: str, signals: list[str]) -> float:
+        if idf_weights:
+            # Sum the IDF weight of each unique signal
+            unique = set(signals)
+            raw = sum(idf_weights.get(s, idf_weights.get(s.split(":")[0], 0.5)) for s in unique)
+        else:
+            raw = float(len(set(signals)))
+        return raw * _recency_multiplier(cve_id, rel_cve)
+
     scored = sorted(
         [(rel_cve, signals) for rel_cve, signals in related.items()],
-        key=lambda x: len(x[1]),
+        key=lambda x: _score_signals(x[0], x[1]),
         reverse=True,
     )
 
     top_related = [
         {
             "cve_id":           rel_cve,
-            "correlation_score": len(signals),
+            "correlation_score": round(_score_signals(rel_cve, signals), 3),
             "signals":          list(set(signals)),
         }
         for rel_cve, signals in scored[:max_related]
@@ -462,6 +543,24 @@ def run(out: str = "data/raw_correlations.json"):
     print(f"  Exploit co-occurrences:  {len(exploit_cooccur)}")
     print(f"  OWASP groups:            {len(owasp_index)}")
 
+    # ── TF-IDF signal weighting ──────────────────────────────────────────
+    idf_weights = compute_idf_weights(
+        total_cves   = len(nvd_records),
+        cwe_index    = cwe_index,
+        product_index= product_index,
+        owasp_index  = owasp_index,
+        attack_index = attack_index,
+        capec_index  = capec_index,
+    )
+    # Report the noisiest groups getting penalised
+    large_groups = [
+        (k, w) for k, w in idf_weights.items() if w < 0.3
+    ]
+    if large_groups:
+        print(f"\n  IDF-penalised signals (weight < 0.3): {len(large_groups)}")
+        for k, w in sorted(large_groups, key=lambda x: x[1])[:10]:
+            print(f"    {k[:55]:55s}  weight={w:.3f}")
+
     # Build NVD lookup for quick access
     nvd_by_cve = {r.get("cve_id", ""): r for r in nvd_records if r.get("cve_id")}
 
@@ -482,6 +581,7 @@ def run(out: str = "data/raw_correlations.json"):
             exploit_cooccur = exploit_cooccur,
             owasp_index     = owasp_index,
             mitre_data      = mitre_data,
+            idf_weights     = idf_weights,
         )
         correlation_records.append(corr)
         if corr["related_vulnerabilities"]:

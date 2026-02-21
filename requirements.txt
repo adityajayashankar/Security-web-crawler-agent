@@ -28,6 +28,10 @@ scholarly                # Google Scholar (note: gets CAPTCHA-blocked in prod)
 # ── Closed source crawling ────────────────────────────────────────────────
 praw                     # Reddit API wrapper
 
+# ── Agentic pipeline (LangGraph) ─────────────────────────────────────────
+langgraph
+langchain-core
+
 # ── Optional: .env file loading ──────────────────────────────────────────
 python-dotenv            # load API keys from .env file
 
