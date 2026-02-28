@@ -31,10 +31,13 @@ praw                     # Reddit API wrapper
 # ── Agentic pipeline (LangGraph) ─────────────────────────────────────────
 langgraph
 langchain-core
+qdrant-client[fastembed]
+pydantic
+sentence-transformers
 
 # ── Optional: .env file loading ──────────────────────────────────────────
 python-dotenv            # load API keys from .env file
-
+neo4j
 # ── API credentials needed (set as env vars or in .env) ──────────────────
 # HACKERONE_USERNAME         HackerOne account username
 # HACKERONE_API_TOKEN        https://hackerone.com/settings/api_token/edit

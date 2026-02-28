@@ -62,18 +62,27 @@ except ImportError:
 
 DEFAULT_CONFIG = Path(__file__).parent / "sources.yaml"
 
-# Rate-limit retry settings for free-tier OpenRouter models
+# Rate-limit retry settings for free-tier models
 LLM_MAX_RETRIES = 3
 LLM_RETRY_BASE_DELAY = 10
 
-# Fallback order - if the primary model is rate-limited, try the next
-FREE_MODEL_FALLBACKS = [
-    "google/gemma-3n-e2b-it:free",
-    "google/gemma-3-27b-it:free",
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "deepseek/deepseek-r1:free",
-    "mistralai/mistral-7b-instruct:free",
+# Fallback order for Groq models
+MODEL_FALLBACKS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
 ]
+
+def _resolve_cache_mode(raw_mode: str | None) -> CacheMode:
+    """Map config string to crawl4ai CacheMode with safe fallback."""
+    mode = (raw_mode or "bypass").strip().lower()
+    mapping = {
+        "bypass": CacheMode.BYPASS,
+        "enabled": CacheMode.ENABLED,
+        "read_only": CacheMode.READ_ONLY,
+        "write_only": CacheMode.WRITE_ONLY,
+        "disabled": CacheMode.DISABLED,
+    }
+    return mapping.get(mode, CacheMode.BYPASS)
 
 
 # ==============================================================================
@@ -94,6 +103,7 @@ class CrawlState(TypedDict, total=False):
     llm_client: Any
     llm_models: list[str]
     tavily_client: Any
+    single_llm_mode: bool
 
     # -- Phase 1 outputs
     search_queries: list[str]
@@ -127,33 +137,34 @@ def load_config(path: Path) -> dict:
 
 
 # ==============================================================================
-# OPENROUTER (LLM)  +  TAVILY (search)
+# GROQ (LLM)  +  TAVILY (search)
 # ==============================================================================
 
 def init_llm(cfg: dict):
-    """Initialize OpenRouter client. Returns (client, model_list)."""
+    """Initialize Groq client (OpenAI-compatible). Returns (client, model_list)."""
     try:
         from openai import OpenAI
     except ImportError:
         sys.exit("[ERROR] openai not installed. Run: pip install openai")
 
     settings = cfg.get("settings", {})
-    api_key  = os.environ.get(settings.get("openrouter_api_key_env", "OPENROUTER_API_KEY"), "")
-    primary  = settings.get("llm_model", "google/gemma-3n-e2b-it:free")
+    api_key = os.environ.get(settings.get("groq_api_key_env", "GROQ_API_KEY"), "")
+    primary = settings.get("llm_model", "llama-3.3-70b-versatile")
+    single_mode  = bool(settings.get("single_llm_request_mode", False))
 
     if not api_key:
-        sys.exit("[ERROR] OPENROUTER_API_KEY not set in environment")
+        sys.exit("[ERROR] GROQ_API_KEY not set in environment")
 
     client = OpenAI(
-        base_url="https://openrouter.ai/api/v1",
+        base_url="https://api.groq.com/openai/v1",
         api_key=api_key,
-        default_headers={
-            "HTTP-Referer": "https://github.com/vuln-pipeline",
-            "X-Title":      "VulnResearchCrawler",
-        },
     )
-    models = [primary] + [m for m in FREE_MODEL_FALLBACKS if m != primary]
-    print(f"  OpenRouter ready: {primary}  (+ {len(models)-1} fallbacks)")
+    if single_mode:
+        models = [primary]
+        print(f"  Groq ready: {primary}  (single-request mode)")
+    else:
+        models = [primary] + [m for m in MODEL_FALLBACKS if m != primary]
+        print(f"  Groq ready: {primary}  (+ {len(models)-1} fallbacks)")
     return client, models
 
 
@@ -177,9 +188,16 @@ def init_tavily(cfg: dict):
 
 def _llm_call_with_fallback(
     client, models: list[str], messages: list[dict],
-    max_tokens: int, temperature: float,
+    max_tokens: int, temperature: float, strict_single: bool = False,
 ) -> str:
     """Try each model in order with retries on 429. Returns raw response text."""
+    if strict_single:
+        resp = client.chat.completions.create(
+            model=models[0], messages=messages,
+            max_tokens=max_tokens, temperature=temperature,
+        )
+        return resp.choices[0].message.content.strip()
+
     last_err = None
     for model in models:
         for attempt in range(LLM_MAX_RETRIES):
@@ -254,6 +272,7 @@ def node_init_clients(state: CrawlState) -> dict:
         "llm_client":    llm_client,
         "llm_models":    llm_models,
         "tavily_client": tavily_client,
+        "single_llm_mode": bool(state["settings"].get("single_llm_request_mode", False)),
     }
 
 
@@ -327,6 +346,7 @@ def node_llm_plan(state: CrawlState) -> dict:
             state["llm_client"], state["llm_models"],
             messages=[{"role": "user", "content": prompt}],
             max_tokens=4096, temperature=0.4,
+            strict_single=state.get("single_llm_mode", False),
         )
         queries = _parse_json_array(raw)
         result  = [q for q in queries if isinstance(q, str) and len(q) > 5][:n_queries]
@@ -350,6 +370,7 @@ def node_tavily_discover(state: CrawlState) -> dict:
     settings    = state["settings"]
     max_per_q   = settings.get("max_results_per_query", 10)
     max_total   = settings.get("max_total_urls", 600)
+    q_delay_s   = float(settings.get("tavily_inter_query_delay_sec", 0.0))
 
     print(f"\n[LangGraph] Phase 2: Tavily discovering URLs ({len(queries)} queries)...")
     url_map: dict[str, str] = {}
@@ -365,7 +386,8 @@ def node_tavily_discover(state: CrawlState) -> dict:
             if url and url not in url_map:
                 url_map[url] = _infer_source_type(url)
 
-        time.sleep(0.3)
+        if q_delay_s > 0:
+            time.sleep(q_delay_s)
 
     print(f"  {total_results} results -> {len(url_map)} unique URLs")
 
@@ -713,7 +735,12 @@ def make_record(url: str, markdown: str, source_type: str, cfg: dict,
     signals   = extract_correlation_signals(markdown, cfg)
 
     # LLM extraction pass: pages with 3+ CVEs get directed chain analysis
-    if len(signals.get("cves_mentioned", [])) >= 3 and llm_client and llm_models:
+    if (
+        settings.get("enable_llm_chain_extraction", True)
+        and len(signals.get("cves_mentioned", [])) >= 3
+        and llm_client
+        and llm_models
+    ):
         llm_chains = _llm_extract_chains(
             markdown, signals["cves_mentioned"], llm_client, llm_models,
         )
@@ -747,7 +774,14 @@ async def crawl_url(
 
     async with semaphore:
         try:
-            run_cfg = CrawlerRunConfig(cache_mode=CacheMode.BYPASS)
+            cache_mode = _resolve_cache_mode(settings.get("crawl_cache_mode", "bypass"))
+            page_timeout = int(settings.get("crawl_page_timeout_ms", 60000))
+            wait_until = settings.get("crawl_wait_until", "domcontentloaded")
+            run_cfg = CrawlerRunConfig(
+                cache_mode=cache_mode,
+                page_timeout=page_timeout,
+                wait_until=wait_until,
+            )
             result  = await crawler.arun(url=url, config=run_cfg)
 
             if result.success and result.markdown:
@@ -929,6 +963,7 @@ Return ONLY a JSON array of {n_queries} query strings:"""
             state["llm_client"], state["llm_models"],
             messages=[{"role": "user", "content": prompt}],
             max_tokens=2048, temperature=0.3,
+            strict_single=state.get("single_llm_mode", False),
         )
         queries = _parse_json_array(raw)
         result  = [q for q in queries if isinstance(q, str) and len(q) > 5][:n_queries]
@@ -956,6 +991,7 @@ def node_discover_round2(state: CrawlState) -> dict:
     crawled_urls = set(state.get("crawled_urls", set()))
     settings     = state["settings"]
     max_r2       = settings.get("max_round2_urls", 150)
+    q_delay_s    = float(settings.get("tavily_inter_query_delay_sec", 0.0))
 
     if not r2_queries:
         return {"r2_url_map": {}}
@@ -972,7 +1008,8 @@ def node_discover_round2(state: CrawlState) -> dict:
             url = r.get("url", "")
             if url and url not in crawled_urls and url not in r2_url_map:
                 r2_url_map[url] = _infer_source_type(url)
-        time.sleep(0.3)
+        if q_delay_s > 0:
+            time.sleep(q_delay_s)
 
     if len(r2_url_map) > max_r2:
         r2_url_map = dict(list(r2_url_map.items())[:max_r2])
@@ -1176,6 +1213,8 @@ def run(
     """
     cfg      = load_config(config_path)
     settings = cfg.get("settings", {})
+    if settings.get("single_llm_request_mode", False):
+        use_round2 = False
     out_file = out_override or settings.get("output_file", "data/raw_blogs.json")
     workers  = concurrency or settings.get("concurrent_tasks", 15)
 

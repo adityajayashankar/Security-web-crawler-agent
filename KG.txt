@@ -1,0 +1,215 @@
+// 1) Constraints
+CREATE CONSTRAINT vuln_id_unique IF NOT EXISTS FOR (n:Vulnerability) REQUIRE n.vuln_id IS UNIQUE;
+CREATE CONSTRAINT cwe_id_unique IF NOT EXISTS FOR (n:CWE) REQUIRE n.cwe_id IS UNIQUE;
+CREATE CONSTRAINT owasp_id_unique IF NOT EXISTS FOR (n:OWASPCategory) REQUIRE n.owasp_id IS UNIQUE;
+CREATE CONSTRAINT software_key_unique IF NOT EXISTS FOR (n:Software) REQUIRE n.software_key IS UNIQUE;
+CREATE CONSTRAINT cwe_cluster_id_unique IF NOT EXISTS FOR (n:CWECluster) REQUIRE n.cluster_id IS UNIQUE;
+CREATE CONSTRAINT stack_profile_id_unique IF NOT EXISTS FOR (n:StackProfile) REQUIRE n.profile_id IS UNIQUE;
+CREATE CONSTRAINT stack_indicator_key_unique IF NOT EXISTS FOR (n:StackIndicator) REQUIRE n.indicator_key IS UNIQUE;
+CREATE CONSTRAINT negative_rule_key_unique IF NOT EXISTS FOR (n:NegativeRule) REQUIRE n.rule_key IS UNIQUE;
+
+// 2) Vulnerability nodes from vuln_dataset
+CALL apoc.load.json("file:///vuln_dataset.json") YIELD value AS row
+WITH row, toUpper(trim(coalesce(row.cve_id,""))) AS vid
+WHERE vid =~ '(?i)^(CVE-[0-9]{4}-[0-9]+|GHSA-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})$'
+MERGE (v:Vulnerability {vuln_id: vid})
+ON CREATE SET v.id_type = CASE WHEN vid STARTS WITH "CVE-" THEN "CVE" ELSE "GHSA" END
+SET v.cve_id = CASE WHEN vid STARTS WITH "CVE-" THEN vid ELSE v.cve_id END,
+    v.ghsa_id = CASE WHEN vid STARTS WITH "GHSA-" THEN vid ELSE v.ghsa_id END,
+    v.vulnerability_name = coalesce(v.vulnerability_name, row.vulnerability_name),
+    v.description = coalesce(v.description, row.description),
+    v.cvss_score = coalesce(v.cvss_score, toFloat(row.cvss_score)),
+    v.cvss_severity = coalesce(v.cvss_severity, row.cvss_severity),
+    v.epss_score = coalesce(v.epss_score, toFloat(row.epss_score)),
+    v.published = coalesce(v.published, row.published),
+    v.confirmed_exploited = coalesce(v.confirmed_exploited, row.confirmed_exploited),
+    v.risk_level = coalesce(v.risk_level, row.risk_level),
+    v.source = coalesce(v.source, row.source),
+    v.sources = apoc.coll.toSet(coalesce(v.sources, []) + ["vuln_dataset"]);
+
+// 3) HAS_CWE from vuln_dataset
+CALL apoc.load.json("file:///vuln_dataset.json") YIELD value AS row
+WITH toUpper(trim(coalesce(row.cve_id,""))) AS vid, toUpper(trim(coalesce(row.cwe_id,""))) AS cwe
+WHERE vid =~ '(?i)^(CVE-[0-9]{4}-[0-9]+|GHSA-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})$'
+  AND cwe =~ '(?i)^CWE-[0-9]+$'
+MERGE (v:Vulnerability {vuln_id: vid})
+MERGE (w:CWE {cwe_id: cwe})
+MERGE (v)-[r:HAS_CWE]->(w)
+ON CREATE SET r.sources = ["vuln_dataset"]
+ON MATCH SET r.sources = apoc.coll.toSet(coalesce(r.sources, []) + ["vuln_dataset"]);
+
+// 4) MAPS_TO_OWASP from vuln_dataset
+CALL apoc.load.json("file:///vuln_dataset.json") YIELD value AS row
+WITH toUpper(trim(coalesce(row.cve_id,""))) AS vid, trim(coalesce(row.owasp_category,"")) AS owasp
+WHERE vid =~ '(?i)^(CVE-[0-9]{4}-[0-9]+|GHSA-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})$'
+  AND owasp =~ '^A[0-9]{2}:[0-9]{4}-.+'
+MERGE (v:Vulnerability {vuln_id: vid})
+MERGE (o:OWASPCategory {owasp_id: owasp})
+ON CREATE SET o.code = split(owasp,":")[0]
+MERGE (v)-[r:MAPS_TO_OWASP]->(o)
+ON CREATE SET r.sources = ["vuln_dataset"]
+ON MATCH SET r.sources = apoc.coll.toSet(coalesce(r.sources, []) + ["vuln_dataset"]);
+
+// 5) AFFECTS_SOFTWARE from vuln_dataset
+CALL apoc.load.json("file:///vuln_dataset.json") YIELD value AS row
+WITH toUpper(trim(coalesce(row.cve_id,""))) AS vid, coalesce(row.affected_software, []) AS sws
+WHERE vid =~ '(?i)^(CVE-[0-9]{4}-[0-9]+|GHSA-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4})$'
+UNWIND sws AS sw
+WITH vid, trim(coalesce(sw,"")) AS s
+WHERE s <> ""
+MERGE (v:Vulnerability {vuln_id: vid})
+MERGE (p:Software {software_key: toLower(s)})
+ON CREATE SET p.name = s
+MERGE (v)-[r:AFFECTS_SOFTWARE]->(p)
+ON CREATE SET r.sources = ["vuln_dataset"]
+ON MATCH SET r.sources = apoc.coll.toSet(coalesce(r.sources, []) + ["vuln_dataset"]);
+
+// 6) CORRELATED_WITH from raw_correlations (canonical pair)
+CALL apoc.load.json("file:///raw_correlations.json") YIELD value AS row
+WITH toUpper(trim(coalesce(row.cve_id,""))) AS src, coalesce(row.related_vulnerabilities,[]) AS rels
+WHERE src =~ '(?i)^CVE-[0-9]{4}-[0-9]+$'
+UNWIND rels AS rel
+WITH src, toUpper(trim(coalesce(rel.cve_id,""))) AS tgt, rel
+WHERE tgt =~ '(?i)^CVE-[0-9]{4}-[0-9]+$' AND src <> tgt
+WITH CASE WHEN src < tgt THEN src ELSE tgt END AS a_id,
+     CASE WHEN src < tgt THEN tgt ELSE src END AS b_id,
+     rel
+MERGE (a:Vulnerability {vuln_id: a_id}) ON CREATE SET a.id_type="CVE", a.cve_id=a_id
+MERGE (b:Vulnerability {vuln_id: b_id}) ON CREATE SET b.id_type="CVE", b.cve_id=b_id
+MERGE (a)-[r:CORRELATED_WITH]->(b)
+ON CREATE SET r.max_score = coalesce(toFloat(rel.correlation_score), 0.0),
+              r.signals = [x IN coalesce(rel.signals,[]) WHERE x IS NOT NULL],
+              r.sources = ["raw_correlations"]
+ON MATCH SET r.max_score = CASE
+                             WHEN coalesce(toFloat(rel.correlation_score),0.0) > coalesce(r.max_score,0.0)
+                             THEN toFloat(rel.correlation_score) ELSE r.max_score END,
+              r.signals = apoc.coll.toSet(coalesce(r.signals,[]) + [x IN coalesce(rel.signals,[]) WHERE x IS NOT NULL]),
+              r.sources = apoc.coll.toSet(coalesce(r.sources,[]) + ["raw_correlations"]);
+
+// 7) HAS_CWE from raw_correlations
+CALL apoc.load.json("file:///raw_correlations.json") YIELD value AS row
+WITH toUpper(trim(coalesce(row.cve_id,""))) AS vid, toUpper(trim(coalesce(row.cwe_id,""))) AS cwe
+WHERE vid =~ '(?i)^CVE-[0-9]{4}-[0-9]+$' AND cwe =~ '(?i)^CWE-[0-9]+$'
+MERGE (v:Vulnerability {vuln_id: vid}) ON CREATE SET v.id_type="CVE", v.cve_id=vid
+MERGE (w:CWE {cwe_id: cwe})
+MERGE (v)-[r:HAS_CWE]->(w)
+ON CREATE SET r.sources = ["raw_correlations"]
+ON MATCH SET r.sources = apoc.coll.toSet(coalesce(r.sources, []) + ["raw_correlations"]);
+
+// 8) CORRELATED_WITH from vuln_dataset.related_vulnerabilities (canonical pair)
+CALL apoc.load.json("file:///vuln_dataset.json") YIELD value AS row
+WITH toUpper(trim(coalesce(row.cve_id,""))) AS src, coalesce(row.related_vulnerabilities,[]) AS rels
+WHERE src =~ '(?i)^CVE-[0-9]{4}-[0-9]+$'
+UNWIND rels AS rel
+WITH src, toUpper(trim(coalesce(rel.cve_id,""))) AS tgt, rel
+WHERE tgt =~ '(?i)^CVE-[0-9]{4}-[0-9]+$' AND src <> tgt
+WITH CASE WHEN src < tgt THEN src ELSE tgt END AS a_id,
+     CASE WHEN src < tgt THEN tgt ELSE src END AS b_id,
+     rel
+MERGE (a:Vulnerability {vuln_id: a_id}) ON CREATE SET a.id_type="CVE", a.cve_id=a_id
+MERGE (b:Vulnerability {vuln_id: b_id}) ON CREATE SET b.id_type="CVE", b.cve_id=b_id
+MERGE (a)-[r:CORRELATED_WITH]->(b)
+ON CREATE SET r.max_score = coalesce(toFloat(rel.correlation_score), 0.0),
+              r.signals = [x IN coalesce(rel.signals,[]) WHERE x IS NOT NULL],
+              r.sources = ["vuln_dataset"]
+ON MATCH SET r.max_score = CASE
+                             WHEN coalesce(toFloat(rel.correlation_score),0.0) > coalesce(r.max_score,0.0)
+                             THEN toFloat(rel.correlation_score) ELSE r.max_score END,
+              r.signals = apoc.coll.toSet(coalesce(r.signals,[]) + [x IN coalesce(rel.signals,[]) WHERE x IS NOT NULL]),
+              r.sources = apoc.coll.toSet(coalesce(r.sources,[]) + ["vuln_dataset"]);
+
+// 8b) CO_OCCURS_WITH from raw_cooccurrence_v2.cooccurrence_pairs (canonical pair)
+CALL apoc.load.json("file:///raw_cooccurrence_v2.json") YIELD value
+UNWIND coalesce(value.cooccurrence_pairs, []) AS row
+WITH toUpper(trim(coalesce(row.cve_a, ""))) AS a_raw,
+     toUpper(trim(coalesce(row.cve_b, ""))) AS b_raw,
+     row
+WHERE a_raw =~ '(?i)^CVE-[0-9]{4}-[0-9]+$'
+  AND b_raw =~ '(?i)^CVE-[0-9]{4}-[0-9]+$'
+  AND a_raw <> b_raw
+WITH CASE WHEN a_raw < b_raw THEN a_raw ELSE b_raw END AS a_id,
+     CASE WHEN a_raw < b_raw THEN b_raw ELSE a_raw END AS b_id,
+     row
+MERGE (a:Vulnerability {vuln_id: a_id}) ON CREATE SET a.id_type = "CVE", a.cve_id = a_id
+MERGE (b:Vulnerability {vuln_id: b_id}) ON CREATE SET b.id_type = "CVE", b.cve_id = b_id
+MERGE (a)-[r:CO_OCCURS_WITH]->(b)
+ON CREATE SET r.max_confidence = coalesce(toFloat(row.confidence), 0.0),
+              r.sources = [coalesce(row.source, "raw_cooccurrence_v2")],
+              r.reasons = CASE WHEN row.reason IS NULL THEN [] ELSE [toString(row.reason)] END
+ON MATCH SET r.max_confidence = CASE
+                                  WHEN coalesce(toFloat(row.confidence), 0.0) > coalesce(r.max_confidence, 0.0)
+                                  THEN toFloat(row.confidence) ELSE r.max_confidence END,
+              r.sources = apoc.coll.toSet(coalesce(r.sources, []) + [coalesce(row.source, "raw_cooccurrence_v2")]),
+              r.reasons = apoc.coll.toSet(
+                            coalesce(r.reasons, []) +
+                            CASE WHEN row.reason IS NULL THEN [] ELSE [toString(row.reason)] END
+                          );
+
+// 9) Stack profiles from raw_cooccurrence_v2.stack_profiles
+CALL apoc.load.json("file:///raw_cooccurrence_v2.json") YIELD value
+UNWIND coalesce(value.stack_profiles, []) AS profile_id_raw
+WITH trim(coalesce(profile_id_raw, "")) AS profile_id
+WHERE profile_id <> ""
+MERGE (sp:StackProfile {profile_id: profile_id});
+
+// 10) Profile evidence links from raw_cooccurrence_v2.cooccurrence_pairs
+CALL apoc.load.json("file:///raw_cooccurrence_v2.json") YIELD value
+UNWIND coalesce(value.cooccurrence_pairs, []) AS row
+WITH toUpper(trim(coalesce(row.cve_a, ""))) AS a_id,
+     toUpper(trim(coalesce(row.cve_b, ""))) AS b_id,
+     trim(coalesce(row.profile, "")) AS profile_id,
+     row
+WHERE a_id =~ '(?i)^CVE-[0-9]{4}-[0-9]+$'
+  AND b_id =~ '(?i)^CVE-[0-9]{4}-[0-9]+$'
+  AND profile_id <> ""
+MERGE (sp:StackProfile {profile_id: profile_id})
+MERGE (a:Vulnerability {vuln_id: a_id}) ON CREATE SET a.id_type = "CVE", a.cve_id = a_id
+MERGE (b:Vulnerability {vuln_id: b_id}) ON CREATE SET b.id_type = "CVE", b.cve_id = b_id
+MERGE (sp)-[:PROFILE_INCLUDES]->(a)
+MERGE (sp)-[:PROFILE_INCLUDES]->(b)
+MERGE (a)-[ra:CO_OCCURS_IN_PROFILE]->(sp)
+ON CREATE SET ra.max_confidence = coalesce(toFloat(row.confidence), 0.0),
+              ra.sources = [coalesce(row.source, "raw_cooccurrence_v2")]
+ON MATCH SET ra.max_confidence = CASE
+                                   WHEN coalesce(toFloat(row.confidence), 0.0) > coalesce(ra.max_confidence, 0.0)
+                                   THEN toFloat(row.confidence) ELSE ra.max_confidence END,
+              ra.sources = apoc.coll.toSet(coalesce(ra.sources, []) + [coalesce(row.source, "raw_cooccurrence_v2")])
+MERGE (b)-[rb:CO_OCCURS_IN_PROFILE]->(sp)
+ON CREATE SET rb.max_confidence = coalesce(toFloat(row.confidence), 0.0),
+              rb.sources = [coalesce(row.source, "raw_cooccurrence_v2")]
+ON MATCH SET rb.max_confidence = CASE
+                                   WHEN coalesce(toFloat(row.confidence), 0.0) > coalesce(rb.max_confidence, 0.0)
+                                   THEN toFloat(row.confidence) ELSE rb.max_confidence END,
+              rb.sources = apoc.coll.toSet(coalesce(rb.sources, []) + [coalesce(row.source, "raw_cooccurrence_v2")]);
+
+// 11) Negative inference rules from raw_cooccurrence_v2.negative_rules
+CALL apoc.load.json("file:///raw_cooccurrence_v2.json") YIELD value
+UNWIND coalesce(value.negative_rules, []) AS rule
+WITH trim(coalesce(rule.profile, "")) AS profile_id,
+     trim(coalesce(rule.condition, "")) AS condition,
+     trim(coalesce(rule.reason, "")) AS reason,
+     trim(coalesce(rule.display, "")) AS display,
+     coalesce(rule.absent_cves, []) AS absent_cves,
+     coalesce(rule.still_assess, []) AS still_assess
+WHERE profile_id <> "" AND condition <> ""
+MERGE (sp:StackProfile {profile_id: profile_id})
+MERGE (nr:NegativeRule {rule_key: toLower(profile_id + "|" + condition)})
+ON CREATE SET nr.profile_id = profile_id,
+              nr.condition = condition,
+              nr.reason = reason,
+              nr.display = display
+ON MATCH SET nr.reason = coalesce(nr.reason, reason),
+             nr.display = coalesce(nr.display, display)
+MERGE (sp)-[:HAS_NEGATIVE_RULE]->(nr)
+WITH nr, absent_cves, still_assess
+UNWIND absent_cves AS absent_raw
+WITH nr, still_assess, toUpper(trim(coalesce(absent_raw, ""))) AS absent_cve
+WHERE absent_cve =~ '(?i)^CVE-[0-9]{4}-[0-9]+$'
+MERGE (v_abs:Vulnerability {vuln_id: absent_cve}) ON CREATE SET v_abs.id_type = "CVE", v_abs.cve_id = absent_cve
+MERGE (nr)-[:RULE_ABSENT_IF]->(v_abs)
+WITH nr, still_assess
+UNWIND still_assess AS still_raw
+WITH nr, toUpper(trim(coalesce(still_raw, ""))) AS still_cve
+WHERE still_cve =~ '(?i)^CVE-[0-9]{4}-[0-9]+$'
+MERGE (v_still:Vulnerability {vuln_id: still_cve}) ON CREATE SET v_still.id_type = "CVE", v_still.cve_id = still_cve
+MERGE (nr)-[:RULE_STILL_ASSESS]->(v_still);

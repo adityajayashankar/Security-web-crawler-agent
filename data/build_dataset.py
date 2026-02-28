@@ -864,8 +864,24 @@ def to_correlation_training_pairs(record: dict) -> list:
             "agent": "Correlation Agent",
         })
 
-        # (Templates 2 and 3 removed to reduce correlation dominance.
-        #  Co-occurrence generators now handle attack-path and threat-intel framings.)
+        # Template 2: attack-path framing (restored to keep correlation share in 50-60% target band).
+        pairs.append({
+            "instruction": (
+                f"If {cve_id} is exploitable, which related CVEs should we test next "
+                f"to identify likely multi-stage attack paths?"
+            ),
+            "input": desc,
+            "output": (
+                f"Attack-path expansion for {cve_id}:\n\n"
+                "High-priority related CVEs to test next:\n"
+                + rel_lines
+                + "\n\nWhy this matters: correlated CVEs often share product surface, "
+                  "weakness families, or campaign-level exploitation behavior. "
+                  "Treat these as probable chain candidates and validate in priority order."
+            ),
+            "layer": "vulnerability_correlation",
+            "agent": "Correlation Agent",
+        })
 
     # Template 4: ATT&CK technique mapping
     techniques = record.get("attack_techniques", [])
@@ -962,7 +978,25 @@ def to_owasp_cooccurrence_pairs(record: dict) -> list:
         "agent": "Co-occurrence Agent",
     })
 
-    # (Template 2 removed to reduce pair count — single OWASP template per record.)
+    # Template 2: risk-propagation framing — restored to increase co-occurrence share.
+    pairs.append({
+        "instruction": (
+            f"If {cve_id} is confirmed in production under {owasp_short}, "
+            f"which additional OWASP categories should we proactively test next and why?"
+        ),
+        "input": desc,
+        "output": (
+            f"Risk-propagation guidance for {cve_id} ({owasp}):\n\n"
+            f"Prioritize follow-up testing for these statistically linked categories:\n\n"
+            + co_lines
+            + "\n\nOperational guidance:\n"
+            "  1. Test the top two categories in the same sprint.\n"
+            "  2. Use direct evidence first, then validate inferred links with targeted scans.\n"
+            "  3. Track findings as a shared root-cause cluster, not isolated defects."
+        ),
+        "layer": "vulnerability_cooccurrence",
+        "agent": "Co-occurrence Agent",
+    })
 
     return pairs
 
@@ -1488,7 +1522,6 @@ def run():
         training_pairs.extend(to_owasp_cooccurrence_pairs(record))
         training_pairs.extend(to_cwe_family_pairs(record))
         training_pairs.extend(to_blog_cooccurrence_pairs(record, blog_map))  # blog CVE pairs & chains
-        kev_only_count += 1  # reuse counter for simplicity
         ghsa_only_count += 1
 
     print(f"  GHSA-only records added (no CVE ID):       {ghsa_only_count}")

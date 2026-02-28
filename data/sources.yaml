@@ -10,13 +10,17 @@ settings:
   concurrent_tasks: 15           # crawl4ai parallel workers
   max_content_chars: 10000
   min_content_chars: 50          # low — CVE pages can be short but still valid
-  max_total_urls: 600            # cap on Round 1 URLs
+  max_total_urls: 220            # efficient cap for Round 1 URLs
+  crawl_page_timeout_ms: 30000   # fail fast on slow domains (default crawl4ai is 60000)
+  crawl_wait_until: domcontentloaded
+  crawl_cache_mode: enabled      # reuse prior crawl results across runs
+  tavily_inter_query_delay_sec: 0.0
   output_file: data/raw_blogs.json
 
   # ── Agentic pipeline settings ──────────────────────────────────────────
-  n_search_queries: 25           # Phase 1: LLM generates this many queries
-  max_results_per_query: 10      # Phase 2: Tavily results per query
-  max_harvested_urls: 100        # Phase 5b: links extracted from crawled pages
+  n_search_queries: 12           # fewer, higher-yield queries
+  max_results_per_query: 8       # lower fan-out per query
+  max_harvested_urls: 40         # keep Phase 5b bounded
   n_round2_queries: 10           # Phase 6: LLM gap analysis follow-up queries
   max_round2_urls: 150           # Phase 7: cap on Round 2 discovery
 
@@ -24,16 +28,15 @@ settings:
   # Key: https://app.tavily.com  (free: 1000 searches/month)
   tavily_api_key_env: TAVILY_API_KEY
 
-  # ── OpenRouter — LLM for query generation + gap analysis ───────────────
-  # Key: https://openrouter.ai/keys  (free models available, no monthly cap)
-  openrouter_api_key_env: OPENROUTER_API_KEY
-  # Free models (pick one):
-  #   google/gemma-3n-e2b-it:free       ← current
-  #   google/gemma-3-27b-it:free
-  #   meta-llama/llama-3.3-70b-instruct:free
-  #   deepseek/deepseek-r1:free
-  #   mistralai/mistral-7b-instruct:free
-  llm_model: google/gemma-3n-e2b-it:free
+  # ── Groq — LLM for query generation + gap analysis ─────────────────────
+  # Key: https://console.groq.com/keys
+  groq_api_key_env: GROQ_API_KEY
+  # Example models:
+  #   llama-3.3-70b-versatile
+  #   llama-3.1-8b-instant
+  llm_model: llama-3.3-70b-versatile
+  single_llm_request_mode: true   # exactly one OpenRouter request (planning only)
+  enable_llm_chain_extraction: false  # disable per-page LLM calls inside crawl workers
 
 # ── Quality filter — ANY match keeps the page ────────────────────────────────
 quality_keywords:
@@ -87,13 +90,13 @@ extraction_targets:
 dynamic:
   vulhub:
     enabled: true
-    max_readmes: 600             # scrape ALL Vulhub CVE READMEs — each is a co-occurrence signal
+    max_readmes: 120             # efficient dynamic expansion cap
     api_url: "https://api.github.com/repos/vulhub/vulhub/git/trees/master?recursive=1"
     raw_base: "https://raw.githubusercontent.com/vulhub/vulhub/master/"
 
   nvd_references:
     enabled: true
-    max_urls: 300
+    max_urls: 80
     nvd_data_path: data/raw_nvd.json
     top_cvss_count: 1000         # pull from top 1000 high-CVSS records
     allowed_domains:

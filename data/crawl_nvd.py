@@ -116,7 +116,7 @@ def fetch_nvd_page(params: dict) -> dict:
 def fetch_nvd_range(
     pub_start_date: str | None = None,
     pub_end_date:   str | None = None,
-    max_results:    int        = 10_000,
+    max_results:    int        = 10_0000,
     batch_size:     int        = 2_000,
 ) -> list[dict]:
     """
@@ -202,7 +202,7 @@ def merge_and_save(existing: dict[str, dict], new_records: list[dict], path: Pat
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-def run(total: int = 10_000, batch: int = 2_000, out: str = "data/raw_nvd.json"):
+def run(total: int = 10_0000, batch: int = 2_000, out: str = "data/raw_nvd.json"):
     out_path = Path(out)
 
     # ── Cache check ────────────────────────────────────────────────────────

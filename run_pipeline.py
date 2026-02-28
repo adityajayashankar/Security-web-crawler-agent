@@ -567,8 +567,8 @@ def main():
                         help="Skip synthetic pair generation")
     parser.add_argument("--no-validate", action="store_true",
                         help="Skip validation step")
-    parser.add_argument("--nvd-total",   type=int, default=10_000,
-                        help="NVD CVE records to fetch (default: 10,000)")
+    parser.add_argument("--nvd-total",   type=int, default=100_000,
+                        help="NVD CVE records to fetch (default: 100,000)")
     args = parser.parse_args()
 
     _banner()

@@ -3,11 +3,10 @@ main.py
 -------
 Entry point for the vulnerability analysis agent.
 Run: python main.py
-
-FIX: Corrected import — file is agents.py not agent.py
 """
-
-from pipeline.agents import run_agent   # ← was: pipeline.agent (wrong filename)
+from dotenv import load_dotenv
+load_dotenv()
+from pipeline.langgraph_agent import run_agent
 
 
 def main():

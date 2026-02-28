@@ -22,6 +22,7 @@ Output:
 
 import json
 import math
+import os
 import re
 from collections import defaultdict
 from datetime import datetime, timedelta
@@ -35,6 +36,29 @@ from typing import Optional
 # clamped to [0.1, 1.0].  Groups with >N members effectively get ~0.1.
 
 IDF_LARGE_GROUP_THRESHOLD = 100  # groups above this start getting penalised
+MAX_RELATED_DEFAULT = int(os.getenv("CORR_MAX_RELATED", "20"))
+MAX_CWE_MEMBERS = int(os.getenv("CORR_MAX_CWE_MEMBERS", "600"))
+MAX_PRODUCT_MEMBERS = int(os.getenv("CORR_MAX_PRODUCT_MEMBERS", "500"))
+MAX_ATTACK_MEMBERS = int(os.getenv("CORR_MAX_ATTACK_MEMBERS", "400"))
+MAX_CAPEC_MEMBERS = int(os.getenv("CORR_MAX_CAPEC_MEMBERS", "400"))
+MAX_OWASP_MEMBERS = int(os.getenv("CORR_MAX_OWASP_MEMBERS", "700"))
+
+
+def _iter_bounded_group(members: set[str], self_id: str, cap: int):
+    """
+    Iterate up to `cap` group members excluding `self_id`.
+    Set iteration keeps this O(cap) without sorting huge groups for 350k scale.
+    """
+    if cap <= 0:
+        return
+    count = 0
+    for rel_cve in members:
+        if rel_cve == self_id:
+            continue
+        yield rel_cve
+        count += 1
+        if count >= cap:
+            break
 
 
 def compute_idf_weights(
@@ -249,7 +273,7 @@ def build_correlation_record(
     owasp_index:     dict[str, set[str]],
     mitre_data:      dict,
     idf_weights:     dict[str, float] | None = None,
-    max_related:     int = 10,
+    max_related:     int = MAX_RELATED_DEFAULT,
 ) -> dict:
     """
     Build a correlation record for a single CVE, gathering all related CVEs
@@ -263,33 +287,29 @@ def build_correlation_record(
     related: dict[str, list[str]] = defaultdict(list)  # {cve_id: [signals]}
 
     # Signal 1: shared CWE
-    for rel_cve in cwe_index.get(cwe, set()):
-        if rel_cve != cve_id:
-            related[rel_cve].append(f"shared_cwe:{cwe}")
+    for rel_cve in _iter_bounded_group(cwe_index.get(cwe, set()), cve_id, MAX_CWE_MEMBERS):
+        related[rel_cve].append(f"shared_cwe:{cwe}")
 
     # Signal 2: shared product
     for sw_item in sw:
         if isinstance(sw_item, str):
             key = re.sub(r"\s+\d[\d.]*\s*$", "", sw_item.lower().strip())[:60]
-            for rel_cve in product_index.get(key, set()):
-                if rel_cve != cve_id:
-                    related[rel_cve].append(f"shared_product:{sw_item[:40]}")
+            for rel_cve in _iter_bounded_group(product_index.get(key, set()), cve_id, MAX_PRODUCT_MEMBERS):
+                related[rel_cve].append(f"shared_product:{sw_item[:40]}")
 
     # Signal 3: ATT&CK technique
     cve_to_techniques = mitre_data.get("cve_to_techniques", {})
     my_techniques = cve_to_techniques.get(cve_id, [])
     for tid in my_techniques:
-        for rel_cve in attack_index.get(tid, set()):
-            if rel_cve != cve_id:
-                related[rel_cve].append(f"shared_attack_technique:{tid}")
+        for rel_cve in _iter_bounded_group(attack_index.get(tid, set()), cve_id, MAX_ATTACK_MEMBERS):
+            related[rel_cve].append(f"shared_attack_technique:{tid}")
 
     # Signal 4: CAPEC
     cwe_to_capec = mitre_data.get("cwe_to_capec", {})
     my_capecs = cwe_to_capec.get(cwe, [])
     for capec_id in my_capecs:
-        for rel_cve in capec_index.get(capec_id, set()):
-            if rel_cve != cve_id:
-                related[rel_cve].append(f"shared_capec:{capec_id}")
+        for rel_cve in _iter_bounded_group(capec_index.get(capec_id, set()), cve_id, MAX_CAPEC_MEMBERS):
+            related[rel_cve].append(f"shared_capec:{capec_id}")
 
     # Signal 5: KEV temporal proximity (campaign)
     for rel_cve in kev_temporal.get(cve_id, set()):
@@ -302,11 +322,10 @@ def build_correlation_record(
             related[rel_cve].append("exploit_chain_cooccurrence")
 
     # Signal 7: Shared OWASP
-    for owasp_cat, owasp_cves in owasp_index.items():
-        if cve_id in owasp_cves:
-            for rel_cve in owasp_cves:
-                if rel_cve != cve_id:
-                    related[rel_cve].append(f"shared_owasp:{owasp_cat[:30]}")
+    owasp_cat = nvd_rec.get("_owasp_category", "Unknown")
+    if owasp_cat and owasp_cat != "Unknown":
+        for rel_cve in _iter_bounded_group(owasp_index.get(owasp_cat, set()), cve_id, MAX_OWASP_MEMBERS):
+            related[rel_cve].append(f"shared_owasp:{owasp_cat[:30]}")
 
     # ── Temporal decay multiplier ──────────────────────────────────────
     # Recent CVE pairs get full weight; older pairs decay.
@@ -561,46 +580,58 @@ def run(out: str = "data/raw_correlations.json"):
         for k, w in sorted(large_groups, key=lambda x: x[1])[:10]:
             print(f"    {k[:55]:55s}  weight={w:.3f}")
 
-    # Build NVD lookup for quick access
-    nvd_by_cve = {r.get("cve_id", ""): r for r in nvd_records if r.get("cve_id")}
+    # Build NVD lookup for quick access and cache OWASP per record once.
+    nvd_by_cve = {}
+    for r in nvd_records:
+        cid = r.get("cve_id", "")
+        if not cid:
+            continue
+        cwe = r.get("cwe_id", "")
+        r["_owasp_category"] = owasp_fn(cwe) if cwe else "Unknown"
+        nvd_by_cve[cid] = r
 
-    # Build correlation records
+    # Build correlation records and stream-write output to avoid O(N) RAM spikes.
     print("\nComputing per-CVE correlations...")
-    correlation_records = []
     cves_with_correlations = 0
+    total_processed = 0
 
-    for cve_id, nvd_rec in nvd_by_cve.items():
-        corr = build_correlation_record(
-            cve_id          = cve_id,
-            nvd_rec         = nvd_rec,
-            cwe_index       = cwe_index,
-            product_index   = product_index,
-            attack_index    = attack_index,
-            capec_index     = capec_index,
-            kev_temporal    = kev_temporal,
-            exploit_cooccur = exploit_cooccur,
-            owasp_index     = owasp_index,
-            mitre_data      = mitre_data,
-            idf_weights     = idf_weights,
-        )
-        correlation_records.append(corr)
-        if corr["related_vulnerabilities"]:
-            cves_with_correlations += 1
-
-    # Save correlation records
     with open(out, "w", encoding="utf-8") as f:
-        json.dump(correlation_records, f, indent=2, ensure_ascii=False)
+        f.write("[")
+        first = True
+        for cve_id, nvd_rec in nvd_by_cve.items():
+            corr = build_correlation_record(
+                cve_id=cve_id,
+                nvd_rec=nvd_rec,
+                cwe_index=cwe_index,
+                product_index=product_index,
+                attack_index=attack_index,
+                capec_index=capec_index,
+                kev_temporal=kev_temporal,
+                exploit_cooccur=exploit_cooccur,
+                owasp_index=owasp_index,
+                mitre_data=mitre_data,
+                idf_weights=idf_weights,
+                max_related=MAX_RELATED_DEFAULT,
+            )
+            if corr["related_vulnerabilities"]:
+                cves_with_correlations += 1
+            if not first:
+                f.write(",")
+            json.dump(corr, f, ensure_ascii=False)
+            first = False
+            total_processed += 1
+            if total_processed % 10000 == 0:
+                print(f"  {total_processed:,} CVEs processed...")
+        f.write("]")
 
     print(f"\n📊 Correlation Summary:")
-    print(f"  CVEs processed:          {len(correlation_records)}")
+    print(f"  CVEs processed:          {total_processed}")
     print(f"  CVEs with correlations:  {cves_with_correlations}")
-    avg_related = sum(
-        len(r["related_vulnerabilities"]) for r in correlation_records
-    ) / max(len(correlation_records), 1)
-    print(f"  Avg related per CVE:     {avg_related:.1f}")
+    ratio = (cves_with_correlations / max(total_processed, 1)) * 100
+    print(f"  Coverage (%):            {ratio:.1f}%")
     print(f"\n✅ Saved correlation graph → {out}")
 
-    return correlation_records
+    return {"total_processed": total_processed, "with_correlations": cves_with_correlations, "output": out}
 
 
 def load_correlations_lookup(path: str = "data/raw_correlations.json") -> dict[str, dict]:

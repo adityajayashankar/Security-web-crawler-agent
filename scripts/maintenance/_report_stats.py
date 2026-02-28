@@ -1,4 +1,5 @@
 import json, os
+from collections import Counter
 
 files = {
     'raw_nvd.json': 'NVD CVEs',
@@ -17,6 +18,7 @@ files = {
     'raw_cwe_chains.json': 'CWE chains',
     'raw_kev_clusters.json': 'KEV clusters',
     'training_pairs.jsonl': 'Training pairs',
+    'training_pairs_augmented_1gb.jsonl': 'Training pairs (augmented)',
     'vuln_dataset.jsonl': 'Vuln dataset',
 }
 
@@ -57,19 +59,34 @@ print(f"{'TOTAL':<30} {'':>10} {total_sz:>10.1f}")
 print("\n--- Training Pair Layer Breakdown ---")
 pair_path = 'data/training_pairs.jsonl'
 if os.path.exists(pair_path):
-    layers = {}
+    layer_counts = Counter()
+    type_counts = Counter()
     with open(pair_path) as fh:
         for line in fh:
             try:
                 rec = json.loads(line)
-                layer = rec.get('type', rec.get('layer', 'unknown'))
-                layers[layer] = layers.get(layer, 0) + 1
+                layer = rec.get('layer', 'unknown')
+                pair_type = rec.get('type', '')
+                layer_counts[layer] += 1
+                if pair_type:
+                    type_counts[pair_type] += 1
             except:
                 pass
-    for layer, cnt in sorted(layers.items(), key=lambda x: -x[1]):
-        pct = cnt / sum(layers.values()) * 100
+    total_pairs = sum(layer_counts.values())
+    for layer, cnt in sorted(layer_counts.items(), key=lambda x: -x[1]):
+        pct = cnt / total_pairs * 100 if total_pairs else 0.0
         print(f"  {layer:<35} {cnt:>8,}  ({pct:.1f}%)")
-    print(f"  {'TOTAL':<35} {sum(layers.values()):>8,}")
+    print(f"  {'TOTAL':<35} {total_pairs:>8,}")
+
+    corr_total = layer_counts.get("vulnerability_correlation", 0) + layer_counts.get("vulnerability_cooccurrence", 0)
+    corr_pct = (corr_total / total_pairs * 100) if total_pairs else 0.0
+    print(f"\n  Correlation + co-occurrence share: {corr_total:,}/{total_pairs:,} ({corr_pct:.1f}%)")
+
+    if type_counts:
+        print("\n--- Training Pair Type Breakdown (secondary tag) ---")
+        for pair_type, cnt in sorted(type_counts.items(), key=lambda x: -x[1]):
+            pct = cnt / total_pairs * 100 if total_pairs else 0.0
+            print(f"  {pair_type:<35} {cnt:>8,}  ({pct:.1f}%)")
 
 # Vuln dataset field coverage
 print("\n--- Vuln Dataset Field Coverage (sample 1000) ---")
