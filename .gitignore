@@ -52,3 +52,9 @@ node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Database/vector backup artifacts (large local files)
+*.dump
+*.backup
+backups/
+data/qdrant/

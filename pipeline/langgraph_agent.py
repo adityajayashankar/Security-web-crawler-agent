@@ -21,8 +21,9 @@ FIXES vs previous version:
 """
 
 import json
+import os
 import re
-from typing import TypedDict
+from typing import Any, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
@@ -98,6 +99,24 @@ TOOL_MENU  = "\n".join([f"  - {k}: {v[1]}" for k, v in TOOLS.items()])
 
 _CVE_RE = re.compile(r"CVE-\d{4}-\d+", re.IGNORECASE)
 _CWE_RE = re.compile(r"CWE-\d+", re.IGNORECASE)
+
+
+def _env_int(name: str, default: int, lower: int, upper: int) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except Exception:
+        value = default
+    return max(lower, min(value, upper))
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "1" if default else "0").strip().lower()
+    return raw not in {"0", "false", "no"}
+
+
+AGENT_GRAPHRAG_TOP_K = _env_int("AGENT_GRAPHRAG_TOP_K", 20, 1, 25)
+AGENT_GRAPHRAG_MAX_HOPS = _env_int("AGENT_GRAPHRAG_MAX_HOPS", 2, 1, 3)
+AGENT_GRAPHRAG_USE_VECTOR = _env_bool("AGENT_GRAPHRAG_USE_VECTOR", default=False)
 
 # FIX 2: Expanded trigger patterns for co-occurrence / correlation queries
 _CORR_HINT_RE = re.compile(
@@ -192,6 +211,7 @@ def _extract_tool_json(tool_results: list[str], tool_name: str) -> dict | None:
 def _fallback_report_from_tools(state: AgentState) -> str:
     graphrag_payload = _extract_tool_json(state.get("tool_results", []), "graphrag_query")
     if isinstance(graphrag_payload, dict):
+        graphrag_payload["query"] = state.get("user_query", graphrag_payload.get("query", ""))
         return json.dumps(graphrag_payload)
 
     likely_payload = _extract_tool_json(state.get("tool_results", []), "likely_on_system")
@@ -261,11 +281,11 @@ def _extract_cwe(text: str) -> str | None:
 
 
 def _should_force_likely_tool(state: AgentState) -> bool:
-    """Force GraphRAG retrieval on step 1 for CVE + co-occurrence queries."""
+    """Force GraphRAG retrieval on step 1 for CVE queries."""
     if state["step_num"] > 0 or state["tool_results"]:
         return False
     user_query = state.get("user_query", "")
-    return bool(_extract_cve(user_query) and _CORR_HINT_RE.search(user_query))
+    return bool(_extract_cve(user_query))
 
 
 def _should_force_cwe_tool(state: AgentState) -> str | None:
@@ -313,6 +333,197 @@ def _looks_like_contract(payload: dict) -> bool:
     return required.issubset(set(payload.keys()))
 
 
+def _collect_action_items(source: dict[str, Any]) -> list[str]:
+    out: list[str] = []
+    for key in ("recommendations", "recommendation", "remediation", "next_steps", "actions"):
+        value = source.get(key)
+        if isinstance(value, str) and value.strip():
+            out.append(value.strip())
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, str) and item.strip():
+                    out.append(item.strip())
+    # Preserve order while de-duplicating.
+    return list(dict.fromkeys(out))
+
+
+def _merge_with_graphrag(state: AgentState, contract: dict[str, Any]) -> dict[str, Any]:
+    """
+    Ensure final contract remains grounded in GraphRAG evidence when available.
+    """
+    merged = dict(contract)
+    merged["query"] = state.get("user_query", merged.get("query", ""))
+    graphrag_payload = _extract_tool_json(state.get("tool_results", []), "graphrag_query")
+    if not (isinstance(graphrag_payload, dict) and _looks_like_contract(graphrag_payload)):
+        return merged
+
+    if not merged.get("direct_evidence"):
+        merged["direct_evidence"] = list(graphrag_payload.get("direct_evidence", []) or [])[:25]
+    if not merged.get("inferred_candidates"):
+        merged["inferred_candidates"] = list(graphrag_payload.get("inferred_candidates", []) or [])[:25]
+    if not merged.get("citations"):
+        merged["citations"] = list(graphrag_payload.get("citations", []) or [])[:25]
+
+    conf = merged.get("confidence_summary") or {}
+    if not isinstance(conf, dict) or float(conf.get("overall", 0.0)) <= 0.0:
+        merged["confidence_summary"] = graphrag_payload.get("confidence_summary", conf)
+
+    if not merged.get("recommended_actions"):
+        merged["recommended_actions"] = list(graphrag_payload.get("recommended_actions", []) or [])
+
+    if not merged.get("entity") or not (merged["entity"] or {}).get("id"):
+        merged["entity"] = graphrag_payload.get("entity", merged.get("entity", {}))
+
+    rel_counts: dict[str, int] = {}
+    for item in merged.get("direct_evidence", []) or []:
+        rel = str((item or {}).get("rel_type", "")).strip() or "UNKNOWN"
+        rel_counts[rel] = rel_counts.get(rel, 0) + 1
+    merged["evidence_breakdown"] = {
+        "direct_count": len(merged.get("direct_evidence", []) or []),
+        "inferred_count": len(merged.get("inferred_candidates", []) or []),
+        "by_rel_type": rel_counts,
+    }
+    return merged
+
+
+def _contract_from_audit_finding(state: AgentState, payload: dict) -> dict | None:
+    """
+    Map legacy FINAL payload shape {"audit_finding": {...}} into contract JSON.
+    """
+    finding = payload.get("audit_finding")
+    if not isinstance(finding, dict):
+        return None
+
+    cve_id = str(
+        finding.get("cve_id")
+        or finding.get("cve")
+        or _extract_cve(state.get("user_query", ""))
+        or ""
+    ).upper()
+
+    graphrag_payload = _extract_tool_json(state.get("tool_results", []), "graphrag_query") or {}
+    if isinstance(graphrag_payload, dict):
+        direct = list(graphrag_payload.get("direct_evidence", []) or [])[:10]
+        inferred = list(graphrag_payload.get("inferred_candidates", []) or [])[:10]
+        citations = list(graphrag_payload.get("citations", []) or [])[:10]
+        conf = graphrag_payload.get("confidence_summary", {}) or {}
+        overall = float(conf.get("overall", 0.0)) if isinstance(conf, dict) else 0.0
+        rationale = (
+            conf.get("rationale", "Mapped from FINAL audit_finding with graphrag support.")
+            if isinstance(conf, dict)
+            else "Mapped from FINAL audit_finding with graphrag support."
+        )
+    else:
+        likely_payload = _extract_tool_json(state.get("tool_results", []), "likely_on_system") or {}
+        rows = likely_payload.get("results", []) if isinstance(likely_payload, dict) else []
+        direct = [r for r in rows if str(r.get("evidence_tier", "")).startswith("direct")]
+        inferred = [r for r in rows if r not in direct]
+        overall = round(
+            sum(float(r.get("likelihood", 0.0)) for r in rows[:5]) / max(len(rows[:5]), 1),
+            3,
+        ) if rows else 0.0
+        citations = [
+            {
+                "citation_id": f"audit-{idx+1}",
+                "source_type": r.get("rel_type", "kg"),
+                "entity_id": r.get("cve_id", ""),
+                "snippet": ", ".join(r.get("signals", [])[:2]) or "audit finding support",
+                "metadata": {"tier": r.get("evidence_tier", "unknown")},
+            }
+            for idx, r in enumerate(rows[:10])
+        ]
+        rationale = "Mapped from FINAL audit_finding with likely_on_system support."
+
+    return {
+        "status": "ok",
+        "query": state.get("user_query", ""),
+        "entity": {"type": "cve" if cve_id.startswith("CVE-") else "unknown", "id": cve_id},
+        "direct_evidence": direct[:10],
+        "inferred_candidates": inferred[:10],
+        "citations": citations,
+        "confidence_summary": {
+            "overall": overall,
+            "rationale": rationale,
+        },
+        "hitl": {"required": False, "reasons": []},
+        "recommended_actions": _collect_action_items(finding),
+        "audit_finding": finding,
+    }
+
+
+def _contract_from_summary_fields(state: AgentState, payload: dict) -> dict | None:
+    """
+    Map alternate FINAL payload shape:
+    {"vulnerability","cve","cvss","owasp","risk_level","business_impact","priority","recommendations"}
+    into strict contract JSON.
+    """
+    if not isinstance(payload, dict):
+        return None
+    if "cve" not in payload and "vulnerability" not in payload:
+        return None
+
+    cve_id = str(
+        payload.get("cve")
+        or _extract_cve(state.get("user_query", ""))
+        or ""
+    ).upper()
+
+    graphrag_payload = _extract_tool_json(state.get("tool_results", []), "graphrag_query") or {}
+    if isinstance(graphrag_payload, dict):
+        direct = list(graphrag_payload.get("direct_evidence", []) or [])[:10]
+        inferred = list(graphrag_payload.get("inferred_candidates", []) or [])[:10]
+        citations = list(graphrag_payload.get("citations", []) or [])[:10]
+        conf = graphrag_payload.get("confidence_summary", {}) or {}
+        overall = float(conf.get("overall", 0.0)) if isinstance(conf, dict) else 0.0
+        rationale = (
+            conf.get("rationale", "Mapped from FINAL summary payload with graphrag support.")
+            if isinstance(conf, dict)
+            else "Mapped from FINAL summary payload with graphrag support."
+        )
+    else:
+        likely_payload = _extract_tool_json(state.get("tool_results", []), "likely_on_system") or {}
+        rows = likely_payload.get("results", []) if isinstance(likely_payload, dict) else []
+        direct = [r for r in rows if str(r.get("evidence_tier", "")).startswith("direct")]
+        inferred = [r for r in rows if r not in direct]
+        overall = round(
+            sum(float(r.get("likelihood", 0.0)) for r in rows[:5]) / max(len(rows[:5]), 1),
+            3,
+        ) if rows else 0.0
+        citations = [
+            {
+                "citation_id": f"summary-{idx+1}",
+                "source_type": r.get("rel_type", "kg"),
+                "entity_id": r.get("cve_id", ""),
+                "snippet": ", ".join(r.get("signals", [])[:2]) or "summary support",
+                "metadata": {"tier": r.get("evidence_tier", "unknown")},
+            }
+            for idx, r in enumerate(rows[:10])
+        ]
+        rationale = "Mapped from FINAL summary payload with likely_on_system support."
+
+    recs = payload.get("recommendations", [])
+    if isinstance(recs, str):
+        recs = [recs]
+    if not isinstance(recs, list):
+        recs = []
+
+    return {
+        "status": "ok",
+        "query": state.get("user_query", ""),
+        "entity": {"type": "cve" if cve_id.startswith("CVE-") else "unknown", "id": cve_id},
+        "direct_evidence": direct[:10],
+        "inferred_candidates": inferred[:10],
+        "citations": citations,
+        "confidence_summary": {
+            "overall": overall,
+            "rationale": rationale,
+        },
+        "hitl": {"required": False, "reasons": []},
+        "recommended_actions": [x for x in recs if isinstance(x, str) and x.strip()],
+        "analysis_summary": payload,
+    }
+
+
 def _ensure_contract_json(state: AgentState, raw_answer: str) -> str:
     """
     Guarantee strict JSON contract output regardless of model behavior.
@@ -322,15 +533,29 @@ def _ensure_contract_json(state: AgentState, raw_answer: str) -> str:
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict) and _looks_like_contract(parsed):
-                return json.dumps(parsed)
+                return json.dumps(_merge_with_graphrag(state, parsed))
+            if isinstance(parsed, dict):
+                mapped = _contract_from_audit_finding(state, parsed)
+                if mapped and _looks_like_contract(mapped):
+                    return json.dumps(_merge_with_graphrag(state, mapped))
+                mapped = _contract_from_summary_fields(state, parsed)
+                if mapped and _looks_like_contract(mapped):
+                    return json.dumps(_merge_with_graphrag(state, mapped))
         except Exception:
             pass
 
     graphrag_payload = _extract_tool_json(state.get("tool_results", []), "graphrag_query")
     if isinstance(graphrag_payload, dict) and _looks_like_contract(graphrag_payload):
-        return json.dumps(graphrag_payload)
+        return json.dumps(_merge_with_graphrag(state, graphrag_payload))
 
-    return _fallback_report_from_tools(state)
+    fallback = _fallback_report_from_tools(state)
+    try:
+        parsed = json.loads(fallback)
+        if isinstance(parsed, dict) and _looks_like_contract(parsed):
+            return json.dumps(_merge_with_graphrag(state, parsed))
+    except Exception:
+        pass
+    return fallback
 
 
 def _call_tool(tool_name: str, tool_arg: str) -> str:
@@ -366,8 +591,9 @@ def _planner_node(state: AgentState) -> AgentState:
             {
                 "query": f"cooccurrence for {cve}",
                 "entity": {"type": "cve", "id": cve},
-                "top_k": 12,
-                "max_hops": 2,
+                "top_k": AGENT_GRAPHRAG_TOP_K,
+                "max_hops": AGENT_GRAPHRAG_MAX_HOPS,
+                "use_vector": AGENT_GRAPHRAG_USE_VECTOR,
             }
         )
         response = f"ACTION: graphrag_query({forced_arg})"
@@ -376,8 +602,9 @@ def _planner_node(state: AgentState) -> AgentState:
             {
                 "query": f"cooccurrence for {cwe_target}",
                 "entity": {"type": "cwe", "id": cwe_target},
-                "top_k": 12,
-                "max_hops": 2,
+                "top_k": AGENT_GRAPHRAG_TOP_K,
+                "max_hops": AGENT_GRAPHRAG_MAX_HOPS,
+                "use_vector": AGENT_GRAPHRAG_USE_VECTOR,
             }
         )
         response = f"ACTION: graphrag_query({forced_arg})"

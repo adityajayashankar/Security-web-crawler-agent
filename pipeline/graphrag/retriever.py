@@ -24,6 +24,26 @@ def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return default
+
+
+def _normalize_graph_score(value: float) -> float:
+    """
+    Normalize arbitrary positive edge scores to [0,1] while preserving rank.
+    Avoids hard saturation when raw graph scores are >1.
+    """
+    raw = float(value or 0.0)
+    if raw <= 0:
+        return 0.0
+    if raw <= 1.0:
+        return raw
+    return raw / (1.0 + raw)
+
+
 def _hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]
 
@@ -80,6 +100,66 @@ def _query_cve_neighbors(session, cve_id: str, top_k: int) -> list[dict[str, Any
     ).data()
 
 
+def _query_cve_neighbors_by_type(session, cve_id: str, rel_type: str, top_k: int) -> list[dict[str, Any]]:
+    return session.run(
+        """
+        MATCH (v:Vulnerability {vuln_id: $cve_id})-[r]-(related:Vulnerability)
+        WHERE type(r) = $rel_type
+        RETURN related.vuln_id AS cve_id,
+               coalesce(r.max_score, r.max_confidence, 0.0) AS score,
+               type(r) AS rel_type,
+               coalesce(r.signals, []) AS signals,
+               coalesce(r.reasons, []) AS reasons
+        ORDER BY score DESC
+        LIMIT $top_k
+        """,
+        cve_id=cve_id,
+        rel_type=rel_type,
+        top_k=top_k,
+    ).data()
+
+
+def _mix_cve_neighbors(
+    session,
+    cve_id: str,
+    top_k: int,
+    min_cooccur: int = 0,
+) -> list[dict[str, Any]]:
+    if min_cooccur <= 0:
+        return _query_cve_neighbors(session, cve_id, top_k)
+
+    corr_rows = _query_cve_neighbors_by_type(session, cve_id, "CORRELATED_WITH", top_k=max(top_k, 1))
+    cooc_rows = _query_cve_neighbors_by_type(
+        session,
+        cve_id,
+        "CO_OCCURS_WITH",
+        top_k=max(top_k, min_cooccur),
+    )
+    target_cooc = min(max(min_cooccur, 0), top_k)
+    selected = cooc_rows[:target_cooc] + corr_rows[: max(0, top_k - min(len(cooc_rows), target_cooc))]
+
+    seen: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in selected:
+        key = str(row.get("cve_id", "")).upper().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    if len(deduped) < top_k:
+        remainder = sorted(corr_rows + cooc_rows, key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        for row in remainder:
+            key = str(row.get("cve_id", "")).upper().strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            deduped.append(row)
+            if len(deduped) >= top_k:
+                break
+    return deduped[:top_k]
+
+
 def _compute_second_hop_from_seed_map(
     origin_marker: str,
     hop1_rows: list[dict[str, Any]],
@@ -97,7 +177,7 @@ def _compute_second_hop_from_seed_map(
         if str(r.get("cve_id", "")).strip()
     }
     seed_score_map = {
-        str(r.get("cve_id", "")).upper().strip(): _clamp01(float(r.get("score", 0.0)))
+        str(r.get("cve_id", "")).upper().strip(): _normalize_graph_score(float(r.get("score", 0.0)))
         for r in hop1_rows
         if str(r.get("cve_id", "")).strip()
     }
@@ -116,7 +196,7 @@ def _compute_second_hop_from_seed_map(
             if target == origin_marker or target in first_hop_ids:
                 continue
 
-            edge_score = _clamp01(float(row.get("score", 0.0)))
+            edge_score = _normalize_graph_score(float(row.get("score", 0.0)))
             combined = _clamp01(seed_score * edge_score * decay)
             if combined <= 0:
                 continue
@@ -148,7 +228,8 @@ def _graph_candidates(entity: GraphEntity, top_k: int, max_hops: int = 2) -> lis
     try:
         with driver.session() as session:
             if entity.type == "cve" and entity.id:
-                hop1 = _query_cve_neighbors(session, entity.id, top_k=top_k)
+                min_cooccur = max(0, min(int(os.getenv("GRAPHRAG_MIN_COOCCUR_PER_CVE", "2")), top_k))
+                hop1 = _mix_cve_neighbors(session, entity.id, top_k=top_k, min_cooccur=min_cooccur)
                 for row in hop1:
                     row["hop"] = 1
                     row["source_type"] = "graph"
@@ -311,15 +392,17 @@ def _fuse_candidates(
     top_k: int,
 ) -> tuple[list[EvidenceItem], list[EvidenceItem], list[Citation]]:
     merged: dict[str, dict[str, Any]] = {}
+    hop1_weight = _clamp01(_env_float("GRAPHRAG_GRAPH_WEIGHT_HOP1", 0.88))
+    hop2_weight = _clamp01(_env_float("GRAPHRAG_GRAPH_WEIGHT_HOP2", 0.55))
 
     for row in graph_rows:
         cve_id = str(row.get("cve_id", "")).upper().strip()
         if not cve_id:
             continue
-        g_score = _clamp01(float(row.get("score", 0.0)))
+        g_score = _normalize_graph_score(float(row.get("score", 0.0)))
         hop = int(row.get("hop", 1))
         is_hop2 = hop >= 2
-        graph_weight = 0.45 if is_hop2 else 0.65
+        graph_weight = hop2_weight if is_hop2 else hop1_weight
         row_payload = {
             "cve_id": cve_id,
             "likelihood": round(graph_weight * g_score, 3),
@@ -422,22 +505,30 @@ def retrieve_hybrid(
     entity: dict[str, Any] | None = None,
     top_k: int = 12,
     max_hops: int = 2,
+    use_vector: bool = True,
 ) -> dict[str, Any]:
     top_k = max(1, min(int(top_k), 25))
     max_hops = max(1, min(int(max_hops), 3))
     ent = _normalize_entity(query, entity)
 
     graph_rows = _graph_candidates(ent, top_k=top_k, max_hops=max_hops)
-    vector_rows = _vector_candidates(query, ent, top_k=top_k)
+    vector_rows = _vector_candidates(query, ent, top_k=top_k) if use_vector else []
     direct, inferred, citations = _fuse_candidates(graph_rows, vector_rows, top_k)
 
     top_scores = [e.likelihood for e in (direct + inferred)[:5]]
     overall = round(sum(top_scores) / max(len(top_scores), 1), 3) if top_scores else 0.0
-    rationale = (
-        f"Hybrid retrieval fused {len(graph_rows)} graph candidates and {len(vector_rows)} vector candidates (max_hops={max_hops})."
-        if (graph_rows or vector_rows)
-        else "No graph/vector evidence found."
-    )
+    if use_vector:
+        rationale = (
+            f"Hybrid retrieval fused {len(graph_rows)} graph candidates and {len(vector_rows)} vector candidates (max_hops={max_hops})."
+            if (graph_rows or vector_rows)
+            else "No graph/vector evidence found."
+        )
+    else:
+        rationale = (
+            f"Graph-only retrieval produced {len(graph_rows)} graph candidates (max_hops={max_hops})."
+            if graph_rows
+            else "No graph evidence found."
+        )
 
     response = GraphRAGAgentResponse(
         status="ok",

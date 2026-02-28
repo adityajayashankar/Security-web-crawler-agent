@@ -19,6 +19,7 @@ Run:
 
 import json
 import logging
+import os
 from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
@@ -34,6 +35,8 @@ CWE_CHAIN_FILE = DATA_DIR / "raw_cwe_chains.json"
 KEV_CLUSTER_FILE = DATA_DIR / "raw_kev_clusters.json"
 OUT_V2         = DATA_DIR / "raw_cooccurrence_v2.json"
 OUT_COMPAT     = DATA_DIR / "raw_cooccurrence.json"
+MAX_NVD_PRODUCTS = int(os.getenv("COOC_MAX_NVD_PRODUCTS", "80000"))
+MAX_NVD_PAIRS = int(os.getenv("COOC_MAX_NVD_PAIRS", "600000"))
 
 # Confidence weights by source
 SOURCE_WEIGHTS = {
@@ -230,12 +233,24 @@ def pairs_from_nvd_products(nvd_records, max_per_product=20):
                 if len(parts) >= 5:
                     cpes.add(f"{parts[3]}:{parts[4]}")
 
+        # Fallback for current crawl schema: affected_software list (no CPE keys).
+        for sw in rec.get("affected_software", []) or []:
+            if not isinstance(sw, str):
+                continue
+            norm = sw.strip().lower()
+            if not norm:
+                continue
+            # Keep this namespaced to avoid colliding with real vendor:product CPE keys.
+            cpes.add(f"sw:{norm[:60]}")
+
         for prod in cpes:
             product_to_cves[prod].append(cve)
 
     pairs = []
     seen  = set()
-    for prod, cves in product_to_cves.items():
+    # Process largest products first for better early signal quality under pair caps.
+    product_items = sorted(product_to_cves.items(), key=lambda kv: len(kv[1]), reverse=True)[:MAX_NVD_PRODUCTS]
+    for prod, cves in product_items:
         cves = list(set(cves))
         if len(cves) < 2:
             continue
@@ -254,6 +269,10 @@ def pairs_from_nvd_products(nvd_records, max_per_product=20):
                 "reason":     f"Both affect same CPE product: {prod}",
                 "product":    prod,
             })
+            if len(pairs) >= MAX_NVD_PAIRS:
+                log.info(f"  NVD product pairs capped at {MAX_NVD_PAIRS:,}")
+                log.info(f"  NVD product co-occurrence pairs: {len(pairs):,}")
+                return pairs
 
     log.info(f"  NVD product co-occurrence pairs: {len(pairs):,}")
     return pairs

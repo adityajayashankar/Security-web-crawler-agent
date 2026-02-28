@@ -148,14 +148,20 @@ def tool_graphrag_query(arg: str) -> str:
 
     Arg:
       JSON string preferred:
-        {"query":"...", "entity":{"type":"cve|cwe","id":"..."}, "top_k":12, "max_hops":2}
+        {"query":"...", "entity":{"type":"cve|cwe","id":"..."}, "top_k":12, "max_hops":2, "use_vector":false}
       or raw text query.
 
     Returns:
       Strict JSON contract with evidence, citations, confidence, and HITL status.
     """
     raw = (arg or "").strip()
-    req = {"query": raw, "entity": None, "top_k": 12, "max_hops": 2}
+    req = {
+        "query": raw,
+        "entity": None,
+        "top_k": 12,
+        "max_hops": 2,
+        "use_vector": os.getenv("GRAPHRAG_USE_VECTOR", "0").strip().lower() not in {"0", "false", "no"},
+    }
     if raw.startswith("{"):
         try:
             parsed = json.loads(raw)
@@ -163,6 +169,8 @@ def tool_graphrag_query(arg: str) -> str:
             req["entity"] = parsed.get("entity")
             req["top_k"] = _clamp_int(int(parsed.get("top_k", 12)), 1, 25)
             req["max_hops"] = _clamp_int(int(parsed.get("max_hops", 2)), 1, 3)
+            if "use_vector" in parsed:
+                req["use_vector"] = str(parsed.get("use_vector", "")).strip().lower() not in {"0", "false", "no"}
         except (json.JSONDecodeError, ValueError, TypeError):
             pass
 
@@ -219,6 +227,7 @@ def tool_graphrag_query(arg: str) -> str:
             entity=req["entity"],
             top_k=req["top_k"],
             max_hops=req["max_hops"],
+            use_vector=req["use_vector"],
         )
         hitl = evaluate_hitl_policy(payload)
         payload["hitl"] = hitl
