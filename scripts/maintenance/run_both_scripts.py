@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""
-Wrapper script to run both analysis scripts and capture output.
-"""
+"""Wrapper script to run both analysis scripts and capture output."""
 import subprocess
 import sys
 from pathlib import Path
