@@ -1,8 +1,8 @@
 """
 stack_profiles.py
 ─────────────────────────────────────────────────────────────────────────────
-Technology stack profiles used by build_cooccurrence_v2.py and
-generate_cooccurrence_pairs.py.
+Technology stack profiles used by scripts/dataset/build_cooccurrence_v2.py and
+scripts/dataset/generate_cooccurrence_pairs.py.
 
 Each profile defines:
   - indicators:       keywords that identify this stack in a finding

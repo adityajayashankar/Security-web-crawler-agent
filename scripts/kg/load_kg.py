@@ -4,7 +4,7 @@ load_kg.py
 Load vulnerability intelligence artifacts into Neo4j.
 
 Usage:
-  python load_kg.py
+  python scripts/kg/load_kg.py
 
 Required environment:
   NEO4J_PASSWORD

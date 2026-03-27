@@ -1,7 +1,7 @@
 # DeplAI — Vulnerability GraphRAG Pipeline: Comprehensive Project Report
 
-**Date:** March 8, 2026  
-**Status:** Core pipeline operational — full vector ingest in progress
+**Date:** March 9, 2026  
+**Status:** Core pipeline operational — vector ingest at 20k / 1M-2M target; benchmark eval blocked by module path
 
 ---
 
@@ -33,7 +33,7 @@ The agent can answer questions like:
 - *"Which vulnerabilities appear together in ransomware campaigns?"*
 
 The platform is being used to:
-1. Build a **fine-tuned security LLM** (`Foundation-Sec-8B` via QLoRA) on 2.6M vulnerability training pairs.
+1. Build a **fine-tuned security LLM** (`Foundation-Sec-8B` via QLoRA) on 3.5M vulnerability training pairs.
 2. Power a **hybrid GraphRAG retrieval engine** combining symbolic Neo4j graph traversal with dense Qdrant vector search.
 3. Provide a structured **REST API backend** for a graph visualization frontend.
 
@@ -53,7 +53,7 @@ Cybersecurity practitioners face three core intelligence challenges:
 
 ### Why Foundation-Sec-8B Fine-tuning
 
-General-purpose LLMs (GPT-4, LLaMA) do not deeply understand CVE co-occurrence patterns, CWE family relationships, or OWASP category mapping. Foundation-Sec-8B was pre-trained on 80B tokens of cybersecurity-domain text (NVD, advisories, exploit code). Fine-tuning it on our 2.6M domain-specific pairs produces an LLM that:
+General-purpose LLMs (GPT-4, LLaMA) do not deeply understand CVE co-occurrence patterns, CWE family relationships, or OWASP category mapping. Foundation-Sec-8B was pre-trained on 80B tokens of cybersecurity-domain text (NVD, advisories, exploit code). Fine-tuning it on our 3.5M domain-specific pairs produces an LLM that:
 
 - Reasons about multi-CVE attack chains without hallucination
 - Understands CWE hierarchy and OWASP taxonomy natively
@@ -91,7 +91,7 @@ graph TB
     subgraph DataPipeline["Phase 1 — Data Pipeline"]
         CRAWL[Crawlers<br/>data/crawl_*.py]
         CORR[Correlation Builder<br/>build_correlations.py]
-        COOC[Co-occurrence Builder v2<br/>build_cooccurrence_v2.py]
+        COOC[Co-occurrence Builder v2<br/>scripts/dataset/build_cooccurrence_v2.py]
         KEV_CLUST[KEV Campaign Clusterer<br/>cluster_kev_campaigns.py]
         OWASP[OWASP Mapper<br/>owasp_mapper.py]
         DS[Dataset Builder<br/>build_dataset.py]
@@ -100,8 +100,8 @@ graph TB
 
     subgraph Artifacts["Intermediate Artifacts"]
         RAW_JSON[raw_*.json files<br/>~4.9 GB total]
-        VULN_DS[vuln_dataset.jsonl<br/>325k CVEs / 1.28 GB]
-        TRAIN_PAIRS[training_pairs.jsonl<br/>2.6M pairs / 2.07 GB]
+        VULN_DS[vuln_dataset.jsonl<br/>325k CVEs / 1.34 GB]
+        TRAIN_PAIRS[training_pairs.jsonl<br/>3.5M pairs / 3.17 GB]
         MASTER[master_vuln_context.jsonl<br/>enriched per-CVE]
     end
 
@@ -116,7 +116,7 @@ graph TB
 
     subgraph VectorIndex["Phase 4 — Qdrant Vector Index"]
         EMBED[Embedder<br/>BAAI/bge-small-en-v1.5<br/>dim=384, CPU]
-        QDRANT[(Qdrant Cloud<br/>vuln_kg_evidence_v1<br/>225k target vectors)]
+        QDRANT[(Qdrant Cloud<br/>vuln_kg_evidence_v1<br/>1M-2M target)]
     end
 
     subgraph Agent["Runtime — LangGraph Agent"]
@@ -222,7 +222,7 @@ flowchart LR
 
     subgraph Phase2["Phase 2: Correlate"]
         R1 & R2 & R3 & R4 & R5 --> CORR2[build_correlations.py\n5.8M links]
-        R1 & R3 --> COOC2[build_cooccurrence_v2.py\n891k pairs]
+        R1 & R3 --> COOC2[scripts/dataset/build_cooccurrence_v2.py\n891k pairs]
         COLLECT_CWE[collect_cwe_chains.py] --> CHAINS[raw_cwe_chains.json]
         CLUSTER[cluster_kev_campaigns.py] --> KEVCLUST[raw_kev_clusters.json\n160k]
     end
@@ -232,17 +232,17 @@ flowchart LR
         COOC2 --> BUILD
         CHAINS --> BUILD
         BUILD --> VULN[vuln_dataset.jsonl\n325k rows]
-        BUILD --> STACK[stack_profiles.py → raw_cooccurrence_v2]
+        BUILD --> STACK[scripts/dataset/stack_profiles.py → raw_cooccurrence_v2]
         VULN --> EXPAND[expand_training_pairs.py]
-        EXPAND --> TP[training_pairs.jsonl\n2.6M pairs]
-        SYNTH[generate_synthetic_pairs.py] --> TP
-        COOC_PAIRS[generate_cooccurrence_pairs.py] --> TP
+        EXPAND --> TP[training_pairs.jsonl\n3.5M pairs]
+        SYNTH[scripts/dataset/generate_synthetic_pairs.py] --> TP
+        COOC_PAIRS[scripts/dataset/generate_cooccurrence_pairs.py] --> TP
     end
 
     subgraph Phase4["Phase 4: Master Build + KG Load"]
         VULN & CORR2 & COOC2 --> MASTER2[build_master_dataset.py]
         MASTER2 --> MASTERF[master_vuln_context.jsonl]
-        MASTERF --> KGLOAD[load_kg_master.py]
+        MASTERF --> KGLOAD[scripts/kg/load_kg_master.py]
         KGLOAD --> NEO4J2[(Neo4j KG)]
     end
 
@@ -319,7 +319,7 @@ graph TB
         end
         subgraph VEC_SRC["Vector Path  ·  embeddings.py + qdrant_conn.py"]
             EMBEDDER[BAAI/bge-small-en-v1.5\ndim=384 · CPU]
-            QDRANT[(Qdrant Cloud\nvuln_kg_evidence_v1\n225k vectors)]
+            QDRANT[(Qdrant Cloud\nvuln_kg_evidence_v1\n20k / 1M-2M target)]
             EMBEDDER --> QDRANT
         end
         MERGE[Evidence Merge\ndedup · score-sort · tier-split\ndirect_evidence vs inferred_candidates\ncitation building · confidence scoring]
@@ -393,7 +393,7 @@ Uses Groq LLM to generate search queries → Tavily finds URLs → crawl4ai down
 - Minimum correlation score threshold: ≥0.60
 - Output: 328k rows, 5.8M total links
 
-**`build_cooccurrence_v2.py`** — builds `raw_cooccurrence_v2.json`:
+**`scripts/dataset/build_cooccurrence_v2.py`** — builds `raw_cooccurrence_v2.json`:
 - 8 co-occurrence signal types:
 
 | Signal Type | Count | Meaning |
@@ -409,7 +409,7 @@ Uses Groq LLM to generate search queries → Tavily finds URLs → crawl4ai down
 
 **`cluster_kev_campaigns.py`** — groups KEV entries by temporal proximity and vendor overlap into 160k campaign cluster entries with 63 negative inference rules (pairs that look similar but are NOT related).
 
-**`stack_profiles.py`** — builds 22,192 stack profiles (technology fingerprints) used as co-occurrence signals.
+**`scripts/dataset/stack_profiles.py`** — builds 22,192 stack profiles (technology fingerprints) used as co-occurrence signals.
 
 **`collect_cwe_chains.py`** — maps CWE parent-child and can-precede relationships, feeding `HAS_CWE` and `CONTAINS_CWE` graph edges.
 
@@ -417,7 +417,7 @@ Uses Groq LLM to generate search queries → Tavily finds URLs → crawl4ai down
 
 ### 4.3 Dataset Builder
 
-**`data/build_dataset.py`** → `vuln_dataset.jsonl` (325k rows, 1.28 GB):
+**`data/build_dataset.py`** → `vuln_dataset.jsonl` (325k rows, 1.34 GB):
 
 Each row is a rich per-CVE JSON containing:
 - CVE ID, description, CVSS score, EPSS probability
@@ -428,20 +428,20 @@ Each row is a rich per-CVE JSON containing:
 - ATT&CK technique references
 - Source references (NVD, GitHub, KEV, vendor)
 
-**`data/expand_training_pairs.py`** + synthetic generators → `training_pairs.jsonl` (2.6M pairs, 2.07 GB):
+**`data/expand_training_pairs.py`** + synthetic generators → `training_pairs.jsonl` (3.5M pairs, 3.17 GB):
 
 Training pair distribution across 8 task layers:
 
 | Layer | Count | % | Purpose |
 |-------|------:|---|---------|
-| `vulnerability_cooccurrence` | 1,283,158 | 48.7% | "CVE-X and CVE-Y co-occur because..." |
-| `vulnerability_correlation` | 602,732 | 22.9% | "CVE-X is related to CVE-Y due to..." |
-| `vulnerability_intelligence` | 306,137 | 11.6% | OWASP / CWE mapping |
-| `audit_evidence` | 306,051 | 11.6% | Audit finding generation |
-| `risk_scoring` | 131,449 | 5.0% | CVSS/EPSS risk assessment |
-| `pentesting_intelligence` | 4,813 | 0.2% | Attack payloads, detection |
-| `remediation_learning` | 1,993 | 0.1% | Fix recommendations |
-| `execution_context` | 195 | <0.1% | Stack-aware tooling *(below 200 threshold)* |
+| `vulnerability_cooccurrence` | 1,568,794 | 44.7% | "CVE-X and CVE-Y co-occur because..." |
+| `vulnerability_correlation` | 602,732 | 17.2% | "CVE-X is related to CVE-Y due to..." |
+| `execution_context` | 325,964 | 9.3% | Stack-aware tooling |
+| `vulnerability_intelligence` | 306,152 | 8.7% | OWASP / CWE mapping |
+| `audit_evidence` | 306,051 | 8.7% | Audit finding generation |
+| `remediation_learning` | 254,161 | 7.2% | Fix recommendations |
+| `risk_scoring` | 140,784 | 4.0% | CVSS/EPSS risk assessment |
+| `pentesting_intelligence` | 4,813 | 0.1% | Attack payloads, detection |
 
 ---
 
@@ -479,8 +479,7 @@ Training pair distribution across 8 task layers:
 
 - **Collection:** `vuln_kg_evidence_v1`
 - **Embedding model:** `BAAI/bge-small-en-v1.5`, dim=384, cosine similarity, CPU inference
-- **Target size:** 225,000 vectors (first production baseline)
-- **Full chunk estimate:** 6,252,241 chunks
+- **Target size:** 1,000,000 – 2,000,000 vectors (planned; sourced from `master_vuln_context.jsonl`)
 - **Ingest pipeline:** `graphrag_embed_index_qdrant_cpu.py` — streaming, no full JSON load in memory
 - **Throughput observed:** 15.60 embeddings/sec on smoke test (2,000 vectors in 128s)
 - **Chunk strategy:** 900-char structural chunks with 120-char overlap, boundary-aware splitting (prefers section breaks over mid-sentence cuts)
@@ -645,17 +644,17 @@ Express.js server exposing Neo4j through REST with:
 
 ### 4.13 Validation
 
-**`validate_dataset.py`** — dataset quality checker:
+**`scripts/analysis/validate_dataset.py`** — dataset quality checker:
 - Token length distribution (with/without tokenizer)
 - Duplicate detection and optional deduplication (`--fix`)
 - Short-output detection (drops examples <80 chars)
 - Layer coverage analysis
 
-**`data/validate_dataset.py`** — deep vuln_dataset checks:
+**`scripts/analysis/validate_dataset.py`** — deep vuln_dataset checks:
 - CVSS/EPSS/CWE/software coverage percentages
 - Expected count thresholds per layer
 
-**KG validation** (Cypher queries defined in `KG_VALIDATION_CHECKLIST.md`):
+**KG validation** (Cypher queries defined in `docs/kg/KG_VALIDATION_CHECKLIST.md`):
 - Schema + volume sanity (labels, relationship types, constraint existence)
 - Null/duplicate node IDs
 - Self-loop detection
@@ -679,16 +678,16 @@ Vendors ─────┘│   │   │    └──► build_correlations ─
               │                 collect_cwe_chains ───► raw_cwe_chains.json (5MB)
               │                 stack_profiles ────────► (embedded in cooccurrence)
               │
-              └──► build_dataset.py ──────────────────► vuln_dataset.jsonl (325k, 1.28GB)
+              └──► build_dataset.py ──────────────────► vuln_dataset.jsonl (325k, 1.34GB)
                         │
-                        ├──► expand_training_pairs ──► training_pairs.jsonl (2.6M, 2GB)
+                        ├──► expand_training_pairs ──► training_pairs.jsonl (3.5M, 3.17GB)
                         │    generate_cooccurrence_pairs
                         │    generate_synthetic_pairs
                         │
                         └──► build_master_dataset ───► master_vuln_context.jsonl
                                     │
                                     ├──► load_kg_master ──────────────► Neo4j (407k nodes, 6.9M edges)
-                                    └──► graphrag_embed_index_cpu ────► Qdrant (225k vectors)
+                                    └──► graphrag_embed_index_cpu ────► Qdrant (20k / 1M-2M target)
 ```
 
 ---
@@ -805,7 +804,7 @@ stateDiagram-v2
 | Risk scoring + CVSS analysis | ✅ Full | LLM `risk_scoring` layer |
 | Audit finding generation | ✅ Full | LLM `audit_evidence` layer |
 | Remediation recommendation | ✅ Full | LLM `remediation_learning` layer |
-| Hybrid vector + graph retrieval | ⚠️ Partial | Vector ingest in progress (2k/225k) |
+| Hybrid vector + graph retrieval | ⚠️ Partial | Vector ingest in progress (20k / 1M-2M target) |
 | Full semantic evidence retrieval | 🔲 Pending | Requires full Qdrant ingest completion |
 | Fine-tuned model inference | 🔲 Pending | Training pending full data pipeline |
 | REST API for graph frontend | ✅ Full | Express.js + Neo4j driver |
@@ -847,17 +846,19 @@ The deterministic HITL escalation ensures the agent **never silently returns low
 | `raw_kev_clusters.json` | 160,594 | 41.2 MB |
 | `raw_epss.json` | 305,266 | 8.6 MB |
 | `raw_github.json` | 3,000 | 10.0 MB |
-| `training_pairs.jsonl` | 2,636,528 | 2,067.3 MB |
-| `vuln_dataset.jsonl` | 325,941 | 1,278.7 MB |
-| **Total** | | **~4.9 GB** |
+| `vuln_dataset.jsonl` | 325,941 | 1,340.1 MB |
+| `master_vuln_context.jsonl` | 325,942 | 3,055.0 MB |
+| **Total** | | **~5.8 GB** |
 
 ### Knowledge Graph Scale
 
 - **407,713 nodes**, **6,928,186 relationships**
 - **5,120,356** CORRELATED_WITH edges (primary reasoning edges)
-- **6.25M chunk candidates** for vector indexing
+- Planned **1M-2M chunks** for vector indexing (from `master_vuln_context.jsonl`)
 
 ### Agent Performance (live probe — CVE-2021-28310)
+
+> **Note:** Automated benchmark (`eval/run_graphrag_benchmark.py`) currently returns errors (`No module named 'pipeline'`) when run outside the project root. The figures below are from a manual agent probe.
 
 - Primary tool call: `graphrag_query` (forced by CVE + correlation guardrail)
 - Direct evidence returned: **20 results** (18 CORRELATED_WITH + 2 CO_OCCURS_WITH)
@@ -870,12 +871,11 @@ The deterministic HITL escalation ensures the agent **never silently returns low
 
 | Gap | Impact | Fix |
 |----|--------|-----|
-| Vector ingest incomplete (2k/225k vectors) | Hybrid retrieval underutilized | Run full ingest: `--max-vectors 225000` |
+| Vector ingest incomplete (20k / 1M-2M target) | Hybrid retrieval underutilized | Run full ingest: `--max-vectors 1000000` (or `2000000`) |
+| Benchmark eval errors (`No module named 'pipeline'`) | P@K / R@K scores unmeasurable; all 120 probes fail | Run from project root with `PYTHONPATH=.` or via `python -m eval.run_graphrag_benchmark` |
 | `raw_exploitdb.json` is empty | No PoC exploit evidence layer | Fix ExploitDB crawler auth/pagination |
-| `execution_context` layer below 200 threshold | Weak stack-aware tooling output | Expand synthetic pairs for this layer |
 | Blog dataset small (228 pages) | Limited web threat intelligence | Re-run agentic crawler with wider queries |
 | Decommissioned LLM model IDs in old configs | Rate limit exhaustion if triggered | Confirmed clean in current `model_loader.py` |
-| Full 6.25M vector ingest would take ~4 days at 15.6 emb/sec | Full semantic coverage lag | Phase the ingest by source priority; enable GPU if available |
 | Fine-tuned model not yet deployed | Agent uses API LLMs, not domain model | Complete training run + push to HF Hub |
 
 ---
@@ -890,16 +890,16 @@ The deterministic HITL escalation ensures the agent **never silently returns low
 python run_pipeline.py
 
 # 3. Validate dataset
-python validate_dataset.py --no-tokenizer
+python scripts/analysis/validate_dataset.py --no-tokenizer
 
 # 4. Build master dataset
 python data/build_master_dataset.py
 
 # 5. Load Neo4j KG
-python load_kg_master.py
+python scripts/kg/load_kg_master.py
 
-# 6. Start vector ingest
-python scripts/maintenance/graphrag_embed_index_qdrant_cpu.py --max-vectors 225000 --batch-size 64 --qdrant-batch-size 256
+# 6. Start vector ingest (1M chunk target)
+python scripts/maintenance/graphrag_embed_index_qdrant_cpu.py --max-vectors 1000000 --batch-size 64 --qdrant-batch-size 256
 
 # 7. Run agent
 python main.py
@@ -913,4 +913,4 @@ cd vuln-graph-backend && node server.js
 
 ---
 
-*Report generated March 8, 2026 — DeplAI Vulnerability GraphRAG Pipeline*
+*Report generated March 9, 2026 — DeplAI Vulnerability GraphRAG Pipeline*

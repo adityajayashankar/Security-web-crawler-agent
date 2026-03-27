@@ -5,9 +5,9 @@ Load the Neo4j knowledge graph from a single combined master dataset file:
   data/master_vuln_context.jsonl
 
 Usage:
-  python load_kg_master.py
-  python load_kg_master.py --master-file data/master_vuln_context.jsonl
-  python load_kg_master.py --max-rows 50000
+  python scripts/kg/load_kg_master.py
+  python scripts/kg/load_kg_master.py --master-file data/master_vuln_context.jsonl
+  python scripts/kg/load_kg_master.py --max-rows 50000
 
 Required environment:
   NEO4J_PASSWORD

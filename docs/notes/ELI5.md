@@ -87,8 +87,7 @@ This is a **full ML system**, not a script:
 |---|---|
 | Data pipeline | 18-step orchestrated pipeline |
 | Graph size | 407k nodes, 6.9M edges |
-| Training data | 2.6M pairs, 2.07 GB |
-| Retrieval | Hybrid: graph traversal (Neo4j) + vector search (Qdrant, ~7.5M vectors) |
+| Retrieval | Hybrid: graph traversal (Neo4j) + vector search (Qdrant, 1M-2M planned chunks) |
 | Agent | LangGraph state machine with 12 tools, 15-step loop, HITL policy |
 | Evaluation | Precision@K / Recall@K / FP-rate benchmark with held-out test set |
 | Backend | Express.js REST API for graph visualization |

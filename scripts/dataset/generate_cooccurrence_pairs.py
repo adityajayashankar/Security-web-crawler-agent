@@ -6,7 +6,7 @@ Now generates multiple template variants per CVE + uses KEV pairs directly
 to reach the 15,000 target.
 
 Run:
-  python generate_cooccurrence_pairs.py --count 15000
+  python scripts/dataset/generate_cooccurrence_pairs.py --count 15000
 """
 
 import argparse
@@ -16,7 +16,10 @@ import random
 from collections import defaultdict
 from pathlib import Path
 
-from stack_profiles import STACK_PROFILES
+try:
+    from .stack_profiles import STACK_PROFILES
+except ImportError:
+    from stack_profiles import STACK_PROFILES
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -66,7 +69,9 @@ def load_nvd_index(path):
 
 def load_cooc(path):
     if not path.exists():
-        log.warning(f"  {path} not found — run build_cooccurrence_v2.py first")
+        log.warning(
+            f"  {path} not found — run scripts/dataset/build_cooccurrence_v2.py first"
+        )
         return [], []
     with open(path) as f:
         data = json.load(f)
@@ -900,7 +905,7 @@ def main():
 
     pairs = generate_all_pairs(target_count=args.count)
     write_pairs(pairs, out_path)
-    log.info("\nDone. Run validate_dataset.py to verify quality.")
+    log.info("\nDone. Run scripts/analysis/validate_dataset.py to verify quality.")
 
 
 if __name__ == "__main__":

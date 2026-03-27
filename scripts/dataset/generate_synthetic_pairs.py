@@ -14,9 +14,9 @@ Changes:
   4. KEV-grounded pairs added for remediation layer (high-urgency patch scenarios)
 
 Run AFTER build_dataset.py, BEFORE finetuning.py:
-    python generate_synthetic_pairs.py
+    python scripts/dataset/generate_synthetic_pairs.py
     # or via pipeline:
-    python run_pipeline.py --synthetic
+    python run_pipeline.py
 
 Appends to data/training_pairs.jsonl without touching other layers.
 """

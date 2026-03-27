@@ -6,7 +6,7 @@ Replaces the original raw_cooccurrence.json builder.
 Pulls together FOUR data sources:
   1. CWE chains         (data/raw_cwe_chains.json)       — semantic relationships
   2. KEV clusters       (data/raw_kev_clusters.json)      — campaign co-occurrence
-  3. Stack profiles     (stack_profiles.py)               — expert knowledge
+  3. Stack profiles     (scripts/dataset/stack_profiles.py) — expert knowledge
   4. NVD product data   (data/raw_nvd.json)               — product co-occurrence
 
 Produces:
@@ -14,7 +14,7 @@ Produces:
   (also overwrites data/raw_cooccurrence.json for backward compat)
 
 Run:
-  python build_cooccurrence_v2.py
+  python scripts/dataset/build_cooccurrence_v2.py
 """
 
 import json
@@ -24,7 +24,10 @@ from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
 
-from stack_profiles import STACK_PROFILES
+try:
+    from .stack_profiles import STACK_PROFILES
+except ImportError:
+    from stack_profiles import STACK_PROFILES
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)

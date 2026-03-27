@@ -211,7 +211,7 @@ STEPS = [
     {
         "step": 12, "phase": "correlate",
         "name":  "CWE Exploit Chain Collection",
-        "import_": "collect_cwe_chains",  "fn": "main",
+        "import_": "scripts.dataset.collect_cwe_chains",  "fn": "main",
         "output": [DATA_DIR / "raw_cwe_chains.json"],
         "slow": False,
         "optional": True,
@@ -219,7 +219,7 @@ STEPS = [
     {
         "step": 13, "phase": "correlate",
         "name":  "KEV Campaign Clustering",
-        "import_": "cluster_kev_campaigns",  "fn": "main",
+        "import_": "scripts.dataset.cluster_kev_campaigns",  "fn": "main",
         "output": [DATA_DIR / "raw_kev_clusters.json"],
         "slow": False,
         "optional": True,
@@ -227,7 +227,7 @@ STEPS = [
     {
         "step": 14, "phase": "correlate",
         "name":  "Co-occurrence Model (P(B|A), lift, profiles)",
-        "import_": "build_cooccurrence_v2",  "fn": "main",
+        "import_": "scripts.dataset.build_cooccurrence_v2",  "fn": "main",
         "output": [DATA_DIR / "raw_cooccurrence_v2.json",
                    DATA_DIR / "raw_cooccurrence.json"],
         "slow": False,
@@ -248,7 +248,7 @@ STEPS = [
     {
         "step": 16, "phase": "build",
         "name":  "Co-occurrence Training Pairs (append)",
-        "import_": "generate_cooccurrence_pairs",  "fn": "main",
+        "import_": "scripts.dataset.generate_cooccurrence_pairs",  "fn": "main",
         "output": [DATA_DIR / "training_pairs.jsonl"],
         "slow": False,
         "optional": True,
@@ -257,7 +257,7 @@ STEPS = [
     {
         "step": 17, "phase": "build",
         "name":  "Synthetic Pairs (thin-layer boost — if needed)",
-        "import_": "generate_synthetic_pairs",  "fn": "run",
+        "import_": "scripts.dataset.generate_synthetic_pairs",  "fn": "run",
         "output": [DATA_DIR / "training_pairs.jsonl"],
         "slow": False,
         "conditional": True,
@@ -269,7 +269,7 @@ STEPS = [
     {
         "step": 18, "phase": "validate",
         "name":  "Validate Dataset Quality",
-        "import_": "validate_dataset",  "fn": "main",
+        "import_": "scripts.analysis.validate_dataset",  "fn": "main",
         "output": [],
         "slow": False,
         "optional": True,

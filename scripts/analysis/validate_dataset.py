@@ -19,10 +19,10 @@ CHANGES:
     for the 3× oversampling to be meaningful.
 
 Run BEFORE finetuning.py:
-    python validate_dataset.py
-    python validate_dataset.py --fix              # auto-drop bad examples
-    python validate_dataset.py --no-tokenizer     # fast heuristic mode
-    python validate_dataset.py --max-tokens 8192  # if using full context
+    python scripts/analysis/validate_dataset.py
+    python scripts/analysis/validate_dataset.py --fix              # auto-drop bad examples
+    python scripts/analysis/validate_dataset.py --no-tokenizer     # fast heuristic mode
+    python scripts/analysis/validate_dataset.py --max-tokens 8192  # if using full context
 """
 
 import json

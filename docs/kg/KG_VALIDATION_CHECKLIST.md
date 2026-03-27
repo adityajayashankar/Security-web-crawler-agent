@@ -2,6 +2,19 @@
 
 Use this checklist to validate that the Neo4j knowledge graph is structurally correct and aligned with source data.
 
+## Current Validation Status (March 9, 2026)
+
+| Check | Status | Notes |
+|-------|--------|-------|
+| Neo4j KG loaded | ✅ Pass | 407,713 nodes / 6,928,186 relationships |
+| Automated validation (`validate_kg.py`) | 🔲 Not yet run | Run with `--strict --sample-cves 50 --seed 42` |
+| Automated benchmark (`run_graphrag_benchmark.py`) | ❌ Error | All 120 held-out probes fail: `No module named 'pipeline'` — fix: run from project root with `PYTHONPATH=.` |
+| Ground truth benchmark | ❌ Error | Same import error on all 20 probes |
+| Manual agent probe (CVE-2021-28310) | ✅ Pass | 20 results returned, confidence 0.652, HITL not triggered |
+| Qdrant vector ingest | ⚠️ Partial | 20,038 / 1,000,000–2,000,000 target vectors |
+
+---
+
 ## How To Explain KG Validation (Short Answer)
 
 If someone asks how the KG was validated and de-noised, use this:

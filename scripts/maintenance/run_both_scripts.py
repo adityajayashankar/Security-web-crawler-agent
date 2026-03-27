@@ -6,6 +6,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 def run_script(script_name, args=None):
     """Run a Python script and capture output."""
     cmd = [sys.executable, script_name]
@@ -19,7 +22,7 @@ def run_script(script_name, args=None):
     try:
         result = subprocess.run(
             cmd,
-            cwd=Path(__file__).parent,
+            cwd=REPO_ROOT,
             capture_output=True,
             text=True,
             timeout=300
@@ -45,13 +48,16 @@ if __name__ == "__main__":
     print("Starting dataset analysis...")
     
     # Run analyze_dataset.py
-    rc1 = run_script("analyze_dataset.py")
+    rc1 = run_script("scripts/analysis/analyze_dataset.py")
     
     # Run validate_dataset.py with --no-tokenizer
-    rc2 = run_script("validate_dataset.py", ["--no-tokenizer"])
+    rc2 = run_script("scripts/analysis/validate_dataset.py", ["--no-tokenizer"])
     
     print(f"\n{'='*70}")
-    print(f"Summary: analyze_dataset.py returned {rc1}, validate_dataset.py returned {rc2}")
+    print(
+        "Summary: scripts/analysis/analyze_dataset.py returned "
+        f"{rc1}, scripts/analysis/validate_dataset.py returned {rc2}"
+    )
     print(f"{'='*70}")
     
     sys.exit(max(rc1, rc2))

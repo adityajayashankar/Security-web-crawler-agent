@@ -86,7 +86,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline as hf_pip
 # ── Paths ──────────────────────────────────────────────────────────────────────
 COOCCURRENCE_PATH    = Path("data") / "raw_cooccurrence.json"
 CORRELATIONS_PATH    = Path("data") / "raw_correlations.json"
-STACK_PROFILES_PATH  = Path("stack_profiles.py")  # imported dynamically for negative rules
+STACK_PROFILES_PATH  = Path("scripts") / "dataset" / "stack_profiles.py"  # imported dynamically for negative rules
 
 # ── Evaluation config ──────────────────────────────────────────────────────────
 RECALL_K          = [3, 5, 10]
@@ -368,21 +368,21 @@ def build_directional_probes(cooc_data: dict, max_probes: int) -> list[Probe]:
 
 def _load_stack_profiles() -> dict:
     """
-    Import STACK_PROFILES from stack_profiles.py.
+    Import STACK_PROFILES from scripts/dataset/stack_profiles.py.
     Uses importlib so the eval script doesn't hard-depend on the module at
     import time (it may not be on sys.path in all invocations).
     """
     import importlib.util, sys
     # Try direct import first (works when cwd is repo root)
     try:
-        from stack_profiles import STACK_PROFILES
+        from scripts.dataset.stack_profiles import STACK_PROFILES
         return STACK_PROFILES
     except ImportError:
         pass
     # Fallback: load by path
     spec_path = STACK_PROFILES_PATH
     if not spec_path.exists():
-        spec_path = Path.cwd() / "stack_profiles.py"
+        spec_path = Path.cwd() / "scripts" / "dataset" / "stack_profiles.py"
     if not spec_path.exists():
         return {}
     spec = importlib.util.spec_from_file_location("stack_profiles", str(spec_path))
@@ -397,7 +397,7 @@ def build_negative_probes(max_probes: int) -> list[Probe]:
     Build NEGATIVE probes — present the model with CVE pairs that are
     explicitly NOT correlated, and verify the model says so.
 
-    Ground truth source: ``negative_rules`` in stack_profiles.py.
+    Ground truth source: ``negative_rules`` in scripts/dataset/stack_profiles.py.
     Each negative_rule defines:
       - condition:   when a mitigation is applied
       - absent_cves: CVEs that are absent under that condition
